@@ -15,6 +15,8 @@ class PairModel:
         self.threshold = 0.5
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "PairModel":
+        if len(X) != len(y):
+            raise ValueError("Feature rows and labels must have the same length")
         if len(y) == 0:
             self.estimator = None
             return self
@@ -24,13 +26,19 @@ class PairModel:
             return self
         try:
             from lightgbm import LGBMClassifier
-            self.estimator = LGBMClassifier(n_estimators=250, learning_rate=0.04, num_leaves=15, max_depth=-1,
-                                            class_weight="balanced", random_state=self.random_state, verbosity=-1,
-                                            n_jobs=-1)
-        except ImportError:
-            from sklearn.ensemble import HistGradientBoostingClassifier
-            self.estimator = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.06, max_leaf_nodes=15,
-                                                             l2_regularization=1.0, random_state=self.random_state)
+        except ImportError as exc:
+            raise RuntimeError("LightGBM is required for pair classification") from exc
+        self.estimator = LGBMClassifier(
+            objective="binary",
+            n_estimators=250,
+            learning_rate=0.04,
+            num_leaves=15,
+            max_depth=-1,
+            class_weight="balanced",
+            random_state=self.random_state,
+            verbosity=-1,
+            n_jobs=-1,
+        )
         self.estimator.fit(X, y)
         return self
 
@@ -43,7 +51,11 @@ class PairModel:
 
     def tune_threshold(self, probabilities: Sequence[float], pairs: Sequence[Tuple[str, str]], y_true: Mapping[str, Set[str]],
                        thresholds: Sequence[float] | None = None) -> float:
-        thresholds = thresholds if thresholds is not None else np.arange(0.30, 0.901, 0.01)
+        if len(probabilities) != len(pairs):
+            raise ValueError("Probabilities and candidate pairs must have the same length")
+        thresholds = thresholds if thresholds is not None else np.linspace(0.30, 0.90, 61)
+        if len(thresholds) == 0:
+            raise ValueError("At least one threshold is required")
         best_score, best_threshold = -1.0, 0.90
         for threshold in thresholds:
             predictions: Dict[str, Set[str]] = {sid: set() for sid in y_true}
@@ -57,9 +69,10 @@ class PairModel:
         return best_threshold
 
     def predict_pairs(self, probabilities: Sequence[float], pairs: Sequence[Tuple[str, str]]) -> Dict[str, Set[str]]:
+        if len(probabilities) != len(pairs):
+            raise ValueError("Probabilities and candidate pairs must have the same length")
         result: Dict[str, Set[str]] = {}
         for pair, probability in zip(pairs, probabilities):
             if probability >= self.threshold:
                 result.setdefault(pair[0], set()).add(pair[1])
         return result
-
