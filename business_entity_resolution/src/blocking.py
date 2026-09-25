@@ -42,6 +42,10 @@ class BlockingStore:
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.execute("PRAGMA temp_store=FILE")
         self.connection.execute("PRAGMA cache_size=-200000")
+        # SQLite's RANDOM() would make the index change across runs.  Register a
+        # stable pseudo-random ordering instead, so an overloaded bucket samples
+        # all IDs fairly without introducing non-reproducible validation results.
+        self.connection.create_function("bucket_sample_hash", 2, self._bucket_sample_hash)
         self._rare_token_cache: dict[str, bool] = {}
 
     def close(self) -> None:
@@ -101,6 +105,14 @@ class BlockingStore:
         return int.from_bytes(hashlib.blake2b(entity_id.encode("utf-8"), digest_size=2).digest(), "big") % 5
 
     @staticmethod
+    def _bucket_sample_hash(key: str, entity_id: str) -> int:
+        """Return a stable, signed SQLite integer for uniform bucket sampling."""
+        value = f"{key}\0{entity_id}".encode("utf-8")
+        return int.from_bytes(
+            hashlib.blake2b(value, digest_size=8, person=b"block-cap").digest(), "big"
+        ) & ((1 << 63) - 1)
+
+    @staticmethod
     def _grams(value: str) -> set[str]:
         padded = f"  {value}  "
         return {padded[index:index + 3] for index in range(max(0, len(padded) - 2))}
@@ -129,12 +141,26 @@ class BlockingStore:
     def _keys(self, country: str, name: str, core: str, sorted_core: str, address: str,
               numbers: str, rare_tokens: Iterable[str] = ()) -> list[tuple[str, float]]:
         prefix = core[:5]
+        # Addresses are often equivalent after components are reordered (for
+        # example, "Main St 10, London" versus "London 10 Main St").  Keeping
+        # the set form as a high-specificity block makes this recoverable before
+        # the more expensive fuzzy comparison.
+        address_token_set = " ".join(sorted(set(address.split())))
         keys = [
             (f"full:{country}:{name}", 12.0) if name else None,
             (f"core:{country}:{core}", 10.0) if core else None,
             (f"sorted:{country}:{sorted_core}", 9.0) if sorted_core else None,
             (f"address:{country}:{address}", 7.0) if address else None,
+            (f"address_set:{country}:{address_token_set}", 7.0) if address_token_set else None,
             (f"prefix:{country}:{prefix}", 2.0) if len(prefix) == 5 else None,
+            # Country strings are untrusted metadata: US/USA and similar
+            # variants should not prevent a strong lexical match from blocking.
+            # These deliberately exclude generic prefix and numeric keys, whose
+            # global buckets would be too broad to be useful.
+            (f"global_full:{name}", 8.0) if name else None,
+            (f"global_core:{core}", 7.0) if core else None,
+            (f"global_sorted:{sorted_core}", 6.0) if sorted_core else None,
+            (f"global_address_set:{address_token_set}", 5.0) if address_token_set else None,
         ]
         keys.extend((f"number:{country}:{number}", 3.0) for number in set(numbers.split()) if len(number) >= 3)
         keys.extend((f"phonetic:{country}:{self._soundex(token)}", 2.0)
@@ -204,12 +230,14 @@ class BlockingStore:
         return count
 
     def _bound_keys(self) -> None:
-        """Retain a deterministic slice of overloaded buckets; never delete a key."""
+        """Uniformly sample overloaded buckets instead of favoring low IDs."""
         self.connection.execute("""
             CREATE TABLE bounded_keys AS
             SELECT key, entity_id, weight FROM (
                 SELECT key, entity_id, weight,
-                    ROW_NUMBER() OVER (PARTITION BY key ORDER BY entity_id) AS position
+                    ROW_NUMBER() OVER (
+                        PARTITION BY key ORDER BY bucket_sample_hash(key, entity_id)
+                    ) AS position
                 FROM block_keys
             ) WHERE position <= ?
         """, (self.key_cap,))
@@ -265,7 +293,7 @@ class BlockingStore:
             LOGGER.info("Retrieved blocking candidates from %s (%d targets)", Path(path).name, count)
 
     def finalize_candidates(self) -> int:
-        """Use C-accelerated RapidFuzz scores after an evidence-only short list."""
+        """Rerank an evidence shortlist with balanced lexical and block signals."""
         from rapidfuzz import fuzz, process
         self.connection.execute("""
             CREATE TABLE shortlist AS
@@ -277,7 +305,8 @@ class BlockingStore:
         """, (self.top_k * 3,))
         self.connection.execute("ALTER TABLE shortlist ADD COLUMN similarity REAL")
         reader = self.connection.execute("""
-            SELECT c.source1_id, c.target_id, s.core, s.address, t.core, t.address, c.evidence
+            SELECT c.source1_id, c.target_id, s.core, s.address, t.core, t.address, c.evidence,
+                   MAX(c.evidence) OVER (PARTITION BY c.source1_id) AS max_evidence
             FROM shortlist c JOIN source1 s ON s.entity_id=c.source1_id JOIN targets t ON t.entity_id=c.target_id
         """)
         update_rows = []
@@ -287,8 +316,16 @@ class BlockingStore:
                 break
             name_scores = process.cpdist([row[2] for row in rows], [row[4] for row in rows], scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
             address_scores = process.cpdist([row[3] for row in rows], [row[5] for row in rows], scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
-            update_rows.extend((float(evidence) + float(name) / 20.0 + float(address) / 100.0, sid, tid)
-                               for (sid, tid, *_unused, evidence), name, address in zip(rows, name_scores, address_scores))
+            # Evidence is meaningful, but its raw magnitude varies with the
+            # number of matching keys.  Normalize it within a source record so
+            # it can share a 0..1 scale with RapidFuzz scores.
+            update_rows.extend((
+                0.35 * (np.log1p(float(evidence)) / np.log1p(float(max_evidence)))
+                + 0.45 * (float(name) / 100.0)
+                + 0.20 * (float(address) / 100.0),
+                sid,
+                tid,
+            ) for (sid, tid, *_unused, evidence, max_evidence), name, address in zip(rows, name_scores, address_scores))
             if len(update_rows) >= 100_000:
                 self.connection.executemany("UPDATE shortlist SET similarity=? WHERE source1_id=? AND target_id=?", update_rows)
                 update_rows.clear(); self.connection.commit()
@@ -296,11 +333,37 @@ class BlockingStore:
             self.connection.executemany("UPDATE shortlist SET similarity=? WHERE source1_id=? AND target_id=?", update_rows)
         self.connection.execute("""
             CREATE TABLE final_candidates AS
-            SELECT source1_id, target_id, evidence, similarity,
-                   ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS rank
-            FROM shortlist
-        """)
-        self.connection.execute("DELETE FROM final_candidates WHERE rank > ?", (self.top_k,))
+            WITH shortlist_ranked AS (
+                SELECT source1_id, target_id, evidence, similarity,
+                       ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS shortlist_rank
+                FROM shortlist
+            ), pruned AS (
+                SELECT source1_id, target_id, evidence, similarity
+                FROM shortlist_ranked WHERE shortlist_rank <= ?
+            ), source_ranked AS (
+                SELECT source1_id, target_id, evidence, similarity,
+                       ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS rank,
+                       COUNT(*) OVER (PARTITION BY source1_id) AS candidate_count,
+                       FIRST_VALUE(similarity) OVER (
+                           PARTITION BY source1_id ORDER BY similarity DESC, target_id
+                       ) AS source_best_similarity,
+                       LEAD(similarity) OVER (
+                           PARTITION BY source1_id ORDER BY similarity DESC, target_id
+                       ) AS next_similarity
+                FROM pruned
+            ), ranked AS (
+                SELECT source1_id, target_id, evidence, similarity, rank,
+                       CASE WHEN rank = 1 THEN similarity - COALESCE(next_similarity, 0.0)
+                            ELSE similarity - source_best_similarity END AS score_margin,
+                       CASE WHEN candidate_count <= 1 THEN 1.0
+                            ELSE 1.0 - CAST(rank - 1 AS REAL) / (candidate_count - 1) END AS rank_percentile,
+                       ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY similarity DESC, source1_id) AS target_rank
+                FROM source_ranked
+            )
+            SELECT source1_id, target_id, evidence, similarity, rank, score_margin, rank_percentile,
+                   CASE WHEN rank = 1 AND target_rank = 1 THEN 1.0 ELSE 0.0 END AS reciprocal_best_match
+            FROM ranked
+        """, (self.top_k,))
         self.connection.execute("CREATE UNIQUE INDEX final_pair ON final_candidates(source1_id, target_id)")
         self.connection.execute("DROP TABLE shortlist")
         self.connection.execute("DROP TABLE raw_candidates")
@@ -330,7 +393,7 @@ class BlockingStore:
         cursor = self.connection.execute(f"""
             SELECT c.source1_id, c.target_id, s.country, s.name, s.core, s.sorted_core, s.address, s.numbers,
                    t.country, t.name, t.core, t.sorted_core, t.address, t.numbers,
-                   c.evidence, c.similarity, c.rank,
+                   c.evidence, c.similarity, c.rank, c.score_margin, c.reciprocal_best_match, c.rank_percentile,
                    CASE WHEN truth.target_id IS NULL THEN 0 ELSE 1 END
             FROM final_candidates c
             JOIN source1 s ON s.entity_id=c.source1_id

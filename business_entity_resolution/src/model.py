@@ -13,8 +13,11 @@ class PairModel:
         self.random_state = random_state
         self.estimator = None
         self.threshold = 0.5
+        self.best_params: dict[str, float | int] | None = None
+        self.best_iteration: int | None = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "PairModel":
+    def fit(self, X: np.ndarray, y: np.ndarray,
+            eval_set: tuple[np.ndarray, np.ndarray] | None = None) -> "PairModel":
         if len(X) != len(y):
             raise ValueError("Feature rows and labels must have the same length")
         if len(y) == 0:
@@ -25,19 +28,59 @@ class PairModel:
             self.estimator = ("constant", float(unique[0]))
             return self
         try:
-            from lightgbm import LGBMClassifier
+            from lightgbm import LGBMClassifier, early_stopping
+            from sklearn.metrics import average_precision_score
+            from sklearn.model_selection import train_test_split
         except ImportError as exc:
             raise RuntimeError("LightGBM is required for pair classification") from exc
+        if eval_set is None:
+            class_counts = np.bincount(y.astype(np.int64), minlength=2)
+            # Very small diagnostic datasets cannot be stratified; retain the
+            # old direct-fit behavior in that edge case.
+            if len(y) >= 20 and np.min(class_counts[class_counts > 0]) >= 2:
+                indices = np.arange(len(y))
+                train_idx, eval_idx = train_test_split(
+                    indices, test_size=0.15, stratify=y, random_state=self.random_state,
+                )
+                X_train, y_train, X_eval, y_eval = X[train_idx], y[train_idx], X[eval_idx], y[eval_idx]
+            else:
+                X_train, y_train, X_eval, y_eval = X, y, X, y
+        else:
+            X_train, y_train = X, y
+            X_eval, y_eval = eval_set
+            if len(X_eval) != len(y_eval) or len(y_eval) == 0:
+                raise ValueError("eval_set must contain equally sized, non-empty feature and label arrays")
+
+        # This compact sweep tunes tree capacity and regularization.  Each model
+        # selects its number of trees using a held-out eval_set, then the chosen
+        # configuration is refit on all supplied training rows below.
+        parameter_grid = (
+            {"num_leaves": 15, "min_child_samples": 20, "feature_fraction": 0.90},
+            {"num_leaves": 31, "min_child_samples": 30, "feature_fraction": 0.85},
+            {"num_leaves": 63, "min_child_samples": 60, "feature_fraction": 0.80},
+        )
+        best_score, best_params, best_iteration = -np.inf, parameter_grid[0], 100
+        for params in parameter_grid:
+            candidate = LGBMClassifier(
+                objective="binary", n_estimators=2_000, learning_rate=0.04,
+                class_weight="balanced", random_state=self.random_state, verbosity=-1,
+                n_jobs=-1, **params,
+            )
+            candidate.fit(
+                X_train, y_train, eval_set=[(X_eval, y_eval)], eval_metric="binary_logloss",
+                callbacks=[early_stopping(stopping_rounds=75, verbose=False)],
+            )
+            score = average_precision_score(y_eval, candidate.predict_proba(X_eval)[:, 1])
+            if score > best_score:
+                best_score, best_params = score, params
+                best_iteration = int(candidate.best_iteration_ or candidate.n_estimators_)
+
+        self.best_params = dict(best_params)
+        self.best_iteration = best_iteration
         self.estimator = LGBMClassifier(
-            objective="binary",
-            n_estimators=250,
-            learning_rate=0.04,
-            num_leaves=15,
-            max_depth=-1,
-            class_weight="balanced",
-            random_state=self.random_state,
-            verbosity=-1,
-            n_jobs=-1,
+            objective="binary", n_estimators=best_iteration, learning_rate=0.04,
+            class_weight="balanced", random_state=self.random_state, verbosity=-1,
+            n_jobs=-1, **best_params,
         )
         self.estimator.fit(X, y)
         return self
