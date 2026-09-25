@@ -14,6 +14,7 @@ _NUMBER = re.compile(r"(?<!\w)\d+(?!\w)")
 _LEGAL_SUFFIXES = {
     "corporation": "corp", "corp": "corp", "incorporated": "inc", "inc": "inc",
     "limited": "ltd", "ltd": "ltd", "private": "pvt", "pvt": "pvt",
+    "company": "co", "co": "co", "company limited": "co ltd",
     "limited liability company": "llc", "llc": "llc",
     "societe anonyme": "sa", "s a": "sa", "sa": "sa",
     "s a r l": "sarl", "sarl": "sarl", "s a s": "sas", "sas": "sas",
@@ -38,12 +39,14 @@ _LEGAL_TAIL = re.compile(
 _STREET = {
     "street": "st", "st": "st", "road": "rd", "rd": "rd",
     "avenue": "ave", "ave": "ave", "boulevard": "blvd", "blvd": "blvd",
-    "rue": "rue", "strasse": "str",
+    "drive": "dr", "dr": "dr", "lane": "ln", "ln": "ln", "highway": "hwy", "hwy": "hwy",
+    "parkway": "pkwy", "pkwy": "pkwy", "place": "pl", "pl": "pl", "court": "ct", "ct": "ct",
+    "apartment": "apt", "apt": "apt", "suite": "ste", "ste": "ste", "rue": "rue", "strasse": "str",
 }
 
 
 def _base(text: object) -> str:
-    value = unicodedata.normalize("NFKD", str(text or "").casefold())
+    value = unicodedata.normalize("NFKD", str(text or "").casefold()).replace("&", " and ")
     chars = []
     # NFKD turns Latin accents into an ASCII base letter followed by a combining
     # mark.  Keep marks used by non-Latin scripts (notably Indic vowel signs),

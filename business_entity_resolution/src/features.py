@@ -16,10 +16,13 @@ from .preprocessing import extract_address_numbers, core_name, normalize_address
 
 FEATURE_NAMES = [
     "name_exact", "core_exact", "sorted_core_exact", "address_exact", "country_match",
-    "name_ratio", "core_ratio", "address_ratio", "name_token_jaccard", "name_token_overlap",
-    "address_token_jaccard", "address_token_overlap", "address_number_match", "name_length_ratio",
+    "name_ratio", "core_ratio", "address_ratio", "name_token_sort_ratio", "name_token_set_ratio",
+    "address_token_sort_ratio", "address_token_set_ratio", "name_token_jaccard", "name_token_overlap",
+    "address_token_jaccard", "address_token_overlap", "address_number_match", "address_number_jaccard",
+    "address_number_containment", "core_initials_match", "name_length_ratio",
     "address_length_ratio", "candidate_rank", "rank_percentile", "score_margin",
-    "reciprocal_best_match", "blocking_evidence", "blocking_similarity",
+    "reciprocal_best_match", "source_candidate_count", "target_rank_percentile", "target_is_source2",
+    "blocking_evidence", "blocking_similarity",
     "name_char_ngram_cosine", "address_char_ngram_cosine",
 ]
 
@@ -55,22 +58,51 @@ def _char_ngram_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     return np.asarray(vectors[:count].multiply(vectors[count:]).sum(axis=1)).ravel().astype(np.float32)
 
 
+def _number_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Compare address number sets without treating omitted components as mismatch."""
+    jaccard = np.zeros(len(left), dtype=np.float32)
+    containment = np.zeros(len(left), dtype=np.float32)
+    for index, (a, b) in enumerate(zip(left, right)):
+        a_tokens, b_tokens = set(a.split()), set(b.split())
+        if not a_tokens and not b_tokens:
+            jaccard[index] = containment[index] = 0.5
+            continue
+        if not a_tokens or not b_tokens:
+            continue
+        intersection = len(a_tokens & b_tokens)
+        jaccard[index] = intersection / len(a_tokens | b_tokens)
+        containment[index] = intersection / min(len(a_tokens), len(b_tokens))
+    return jaccard, containment
+
+
+def _initials(value: str) -> str:
+    tokens = value.split()
+    if len(tokens) <= 1:
+        return value
+    return "".join(token[0] for token in tokens if token)
+
+
 def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     """Vectorize one DB batch; edit distances use RapidFuzz's C++ cpdist."""
     if not rows:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
     # (sid, tid, s_country, s_name, s_core, s_sorted, s_address, s_numbers,
     #  t_country, t_name, t_core, t_sorted, t_address, t_numbers, evidence, similarity, rank,
-    #  score_margin, reciprocal_best_match, rank_percentile)
+    #  score_margin, reciprocal_best_match, rank_percentile, source_candidate_count, target_rank_percentile)
     columns = list(zip(*rows))
     s_country, s_name, s_core, s_sorted, s_address, s_numbers = columns[2:8]
     t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
-    evidence, similarity, rank, score_margin, reciprocal_best, rank_percentile = columns[14:20]
+    evidence, similarity, rank, score_margin, reciprocal_best, rank_percentile, source_candidate_count, target_rank_percentile = columns[14:22]
     name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
     core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
     address_ratio = process.cpdist(s_address, t_address, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    name_token_sort = process.cpdist(s_core, t_core, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    name_token_set = process.cpdist(s_core, t_core, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    address_token_sort = process.cpdist(s_address, t_address, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    address_token_set = process.cpdist(s_address, t_address, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
     name_jaccard, name_overlap = _token_scores(s_core, t_core)
     address_jaccard, address_overlap = _token_scores(s_address, t_address)
+    number_jaccard, number_containment = _number_scores(s_numbers, t_numbers)
     name_char_cosine = _char_ngram_cosine(s_core, t_core)
     address_char_cosine = _char_ngram_cosine(s_address, t_address)
     s_name_len, t_name_len = np.asarray([len(value) for value in s_name]), np.asarray([len(value) for value in t_name])
@@ -81,12 +113,17 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
         np.asarray([bool(a) and a == b for a, b in zip(s_sorted, t_sorted)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_address, t_address)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_country, t_country)], dtype=np.float32),
-        name_ratio, core_ratio, address_ratio, name_jaccard, name_overlap, address_jaccard, address_overlap,
+        name_ratio, core_ratio, address_ratio, name_token_sort, name_token_set, address_token_sort, address_token_set,
+        name_jaccard, name_overlap, address_jaccard, address_overlap,
         np.asarray([0.5 if not a or not b else float(a == b) for a, b in zip(s_numbers, t_numbers)], dtype=np.float32),
+        number_jaccard, number_containment,
+        np.asarray([bool(a) and _initials(a) == _initials(b) for a, b in zip(s_core, t_core)], dtype=np.float32),
         np.minimum(s_name_len, t_name_len) / np.maximum(np.maximum(s_name_len, t_name_len), 1),
         np.minimum(s_addr_len, t_addr_len) / np.maximum(np.maximum(s_addr_len, t_addr_len), 1),
         np.asarray(rank, dtype=np.float32), np.asarray(rank_percentile, dtype=np.float32),
         np.asarray(score_margin, dtype=np.float32), np.asarray(reciprocal_best, dtype=np.float32),
+        np.asarray(source_candidate_count, dtype=np.float32), np.asarray(target_rank_percentile, dtype=np.float32),
+        np.asarray([str(target_id).startswith("S2-") for target_id in columns[1]], dtype=np.float32),
         np.asarray(evidence, dtype=np.float32), np.asarray(similarity, dtype=np.float32),
         name_char_cosine, address_char_cosine,
     )).astype(np.float32, copy=False)
@@ -102,7 +139,8 @@ def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -
            str(right.get("country", "")).casefold(), t_name, t_core, t_sorted, t_address, extract_address_numbers(t_address),
            float(retrieval.get("evidence", 0.0)), float(retrieval.get("similarity", 0.0)), float(retrieval.get("rank", 0.0)),
            float(retrieval.get("score_margin", 0.0)), float(retrieval.get("reciprocal_best_match", 0.0)),
-           float(retrieval.get("rank_percentile", 0.0)))
+           float(retrieval.get("rank_percentile", 0.0)), float(retrieval.get("source_candidate_count", 0.0)),
+           float(retrieval.get("target_rank_percentile", 0.0)))
     return dict(zip(FEATURE_NAMES, feature_batch([row])[0].tolist()))
 
 
@@ -122,6 +160,7 @@ def feature_matrix(candidates: Mapping[tuple[str, str], dict], source1: Sequence
                      str(t.get("country", "")).casefold(), t_name, t_core, " ".join(sorted(t_core.split())), t_address, extract_address_numbers(t_address),
                      retrieval.get("evidence", 0.0), retrieval.get("similarity", 0.0), retrieval.get("rank", 0.0),
                      retrieval.get("score_margin", 0.0), retrieval.get("reciprocal_best_match", 0.0),
-                     retrieval.get("rank_percentile", 0.0)))
+                     retrieval.get("rank_percentile", 0.0), retrieval.get("source_candidate_count", 0.0),
+                     retrieval.get("target_rank_percentile", 0.0)))
         pairs.append((source_id, target_id))
     return feature_batch(rows), pairs, list(FEATURE_NAMES)

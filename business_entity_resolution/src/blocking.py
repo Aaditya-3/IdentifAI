@@ -5,6 +5,7 @@ import csv
 import hashlib
 import logging
 import sqlite3
+from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -32,6 +33,12 @@ class BlockingStore:
     MINHASH_PERMUTATIONS = 32
     MINHASH_BANDS = 8
     TOKEN_DF_LIMIT = 5_000
+    ADDRESS_TOKEN_DF_LIMIT = 750
+    MAX_RARE_ADDRESS_TOKENS = 3
+    _ADDRESS_STOP_TOKENS = frozenset({
+        "address", "building", "block", "floor", "lane", "near", "opposite", "road", "street",
+        "the", "and", "with", "from", "main", "nagar", "sector", "state", "district",
+    })
 
     def __init__(self, database: str | Path, top_k: int = TOP_K, key_cap: int = KEY_CAP):
         self.path = Path(database)
@@ -42,16 +49,17 @@ class BlockingStore:
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.execute("PRAGMA temp_store=FILE")
         self.connection.execute("PRAGMA cache_size=-200000")
-        # SQLite's RANDOM() would make the index change across runs.  Register a
-        # stable pseudo-random ordering instead, so an overloaded bucket samples
-        # all IDs fairly without introducing non-reproducible validation results.
-        self.connection.create_function("bucket_sample_hash", 2, self._bucket_sample_hash)
         self._rare_token_cache: dict[str, bool] = {}
+        self._token_frequency_cache: dict[str, int] = {}
+        self._rare_address_vocabulary: dict[str, int] | None = None
 
     def close(self) -> None:
         self.connection.close()
 
     def reset(self) -> None:
+        self._rare_token_cache.clear()
+        self._token_frequency_cache.clear()
+        self._rare_address_vocabulary = None
         self.connection.executescript("""
             DROP TABLE IF EXISTS source1;
             DROP TABLE IF EXISTS targets;
@@ -68,7 +76,7 @@ class BlockingStore:
             CREATE TABLE source1 (
                 entity_id TEXT PRIMARY KEY, country TEXT NOT NULL, name TEXT NOT NULL,
                 core TEXT NOT NULL, sorted_core TEXT NOT NULL, address TEXT NOT NULL,
-                numbers TEXT NOT NULL, split INTEGER NOT NULL
+                numbers TEXT NOT NULL, split INTEGER NOT NULL, retention_priority INTEGER NOT NULL
             );
             CREATE TABLE targets (
                 entity_id TEXT PRIMARY KEY, country TEXT NOT NULL, name TEXT NOT NULL,
@@ -76,7 +84,10 @@ class BlockingStore:
                 numbers TEXT NOT NULL
             );
             CREATE TABLE token_df (token TEXT PRIMARY KEY, frequency INTEGER NOT NULL);
-            CREATE TABLE block_keys (key TEXT NOT NULL, entity_id TEXT NOT NULL, weight REAL NOT NULL);
+            CREATE TABLE block_keys (
+                key TEXT NOT NULL, entity_id TEXT NOT NULL, weight REAL NOT NULL,
+                retention_priority INTEGER NOT NULL
+            );
             CREATE TABLE raw_candidates (
                 source1_id TEXT NOT NULL, target_id TEXT NOT NULL, evidence REAL NOT NULL,
                 PRIMARY KEY (source1_id, target_id)
@@ -105,11 +116,10 @@ class BlockingStore:
         return int.from_bytes(hashlib.blake2b(entity_id.encode("utf-8"), digest_size=2).digest(), "big") % 5
 
     @staticmethod
-    def _bucket_sample_hash(key: str, entity_id: str) -> int:
-        """Return a stable, signed SQLite integer for uniform bucket sampling."""
-        value = f"{key}\0{entity_id}".encode("utf-8")
+    def _retention_priority(entity_id: str) -> int:
+        """Return a reproducible uniform priority for bounded bucket sampling."""
         return int.from_bytes(
-            hashlib.blake2b(value, digest_size=8, person=b"block-cap").digest(), "big"
+            hashlib.blake2b(entity_id.encode("utf-8"), digest_size=8, person=b"block-cap").digest(), "big"
         ) & ((1 << 63) - 1)
 
     @staticmethod
@@ -139,8 +149,9 @@ class BlockingStore:
             return ""
 
     def _keys(self, country: str, name: str, core: str, sorted_core: str, address: str,
-              numbers: str, rare_tokens: Iterable[str] = ()) -> list[tuple[str, float]]:
+              numbers: str, rare_tokens: Iterable[str] = (), rare_address_tokens: Iterable[str] = ()) -> list[tuple[str, float]]:
         prefix = core[:5]
+        initials = "".join(token[0] for token in core.split() if token)
         # Addresses are often equivalent after components are reordered (for
         # example, "Main St 10, London" versus "London 10 Main St").  Keeping
         # the set form as a high-specificity block makes this recoverable before
@@ -161,11 +172,20 @@ class BlockingStore:
             (f"global_core:{core}", 7.0) if core else None,
             (f"global_sorted:{sorted_core}", 6.0) if sorted_core else None,
             (f"global_address_set:{address_token_set}", 5.0) if address_token_set else None,
+            (f"initials:{country}:{initials}", 1.5) if 2 <= len(initials) <= 6 else None,
         ]
         keys.extend((f"number:{country}:{number}", 3.0) for number in set(numbers.split()) if len(number) >= 3)
         keys.extend((f"phonetic:{country}:{self._soundex(token)}", 2.0)
                     for token in rare_tokens if len(token) >= 3 and self._soundex(token))
+        address_tokens = list(rare_address_tokens)
+        keys.extend((f"address_token:{country}:{token}", 1.75) for token in address_tokens)
+        # A pair is selective enough to retain street/locality fragments even
+        # when the full address differs through omissions or reordering.
+        keys.extend((f"address_pair:{country}:{first}:{second}", 3.0)
+                    for first, second in combinations(address_tokens, 2))
         keys.extend((key, 1.5) for key in self._lsh_keys(country, core))
+        if len(core) >= 10:
+            keys.extend((key.replace("lsh::", "global_lsh:", 1), 0.75) for key in self._lsh_keys("", core))
         return [key for key in keys if key is not None]
 
     def _rare_tokens(self, core: str) -> Iterator[str]:
@@ -185,11 +205,41 @@ class BlockingStore:
             if rare:
                 yield token
 
+    def _token_frequency(self, token: str) -> int:
+        frequency = self._token_frequency_cache.get(token)
+        if frequency is None:
+            row = self.connection.execute("SELECT frequency FROM token_df WHERE token=?", (token,)).fetchone()
+            frequency = int(row[0]) if row else 0
+            if len(self._token_frequency_cache) >= 100_000:
+                self._token_frequency_cache.clear()
+            self._token_frequency_cache[token] = frequency
+        return frequency
+
+    def _rare_address_tokens(self, address: str) -> list[str]:
+        """Return a few selective address terms, ordered from rarest to broadest."""
+        vocabulary = self._rare_address_vocabulary
+        if vocabulary is not None:
+            choices = [
+                (vocabulary[token], token) for token in set(address.split())
+                 if len(token) >= 4 and not token.isdigit() and token not in self._ADDRESS_STOP_TOKENS
+                 and token in vocabulary
+            ]
+            return [token for _frequency, token in sorted(choices)[:self.MAX_RARE_ADDRESS_TOKENS]]
+        choices = [
+            (self._token_frequency(token), token)
+            for token in set(address.split())
+            if len(token) >= 4 and not token.isdigit() and token not in self._ADDRESS_STOP_TOKENS
+            and self._token_frequency(token) <= self.ADDRESS_TOKEN_DF_LIMIT
+        ]
+        return [token for _frequency, token in sorted(choices)[:self.MAX_RARE_ADDRESS_TOKENS]]
+
     def build_source_index(self, source1_path: str | Path) -> int:
         """Count document frequencies, then persist Source 1 records and keys."""
         token_rows, token_count = [], 0
         for row in self._records(source1_path):
-            token_rows.extend((token,) for token in set(core_name(row.get("business_name", "")).split()) if len(token) >= 3)
+            core_tokens = set(core_name(row.get("business_name", "")).split())
+            address_tokens = set(normalize_address(row.get("business_address", "")).split())
+            token_rows.extend((token,) for token in core_tokens | address_tokens if len(token) >= 3)
             if len(token_rows) >= 50_000:
                 self.connection.executemany(
                     "INSERT INTO token_df(token, frequency) VALUES (?, 1) ON CONFLICT(token) DO UPDATE SET frequency=frequency+1",
@@ -203,6 +253,13 @@ class BlockingStore:
             )
             token_count += len(token_rows)
         self.connection.commit()
+        self._rare_address_vocabulary = {
+            token: int(frequency) for token, frequency in self.connection.execute(
+                "SELECT token, frequency FROM token_df WHERE frequency <= ? AND length(token) >= 4",
+                (self.ADDRESS_TOKEN_DF_LIMIT,),
+            ) if token not in self._ADDRESS_STOP_TOKENS and not token.isdigit()
+        }
+        LOGGER.info("Loaded %d rare address tokens for blocking", len(self._rare_address_vocabulary))
         retained = self.connection.execute("SELECT COUNT(*) FROM token_df WHERE frequency <= ?", (self.TOKEN_DF_LIMIT,)).fetchone()[0]
         total_tokens = self.connection.execute("SELECT COUNT(*) FROM token_df").fetchone()[0]
         LOGGER.info("Blocking token DF pruning retained %d/%d name tokens (limit=%d)", retained, total_tokens, self.TOKEN_DF_LIMIT)
@@ -213,18 +270,25 @@ class BlockingStore:
             if not entity_id:
                 continue
             country, name, core, sorted_core, address, numbers = self._derived(row)
-            records.append((entity_id, country, name, core, sorted_core, address, numbers, self._stable_split(entity_id)))
+            retention_priority = self._retention_priority(entity_id)
+            records.append((
+                entity_id, country, name, core, sorted_core, address, numbers,
+                self._stable_split(entity_id), retention_priority,
+            ))
             rare_tokens = self._rare_tokens(core)
-            keys.extend((key, entity_id, weight) for key, weight in self._keys(country, name, core, sorted_core, address, numbers, rare_tokens))
+            rare_address_tokens = self._rare_address_tokens(address)
+            keys.extend((key, entity_id, weight, retention_priority) for key, weight in self._keys(
+                country, name, core, sorted_core, address, numbers, rare_tokens, rare_address_tokens,
+            ))
             count += 1
             if count % 20_000 == 0:
-                self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)", records)
-                self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?)", keys)
+                self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
+                self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?, ?)", keys)
                 records.clear(); keys.clear(); self.connection.commit()
         if records:
-            self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)", records)
-            self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?)", keys)
-        self.connection.execute("CREATE INDEX block_keys_key ON block_keys(key, entity_id)")
+            self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
+            self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?, ?)", keys)
+        self.connection.execute("CREATE INDEX block_keys_key_priority ON block_keys(key, retention_priority, entity_id)")
         self.connection.commit()
         self._bound_keys()
         return count
@@ -236,7 +300,7 @@ class BlockingStore:
             SELECT key, entity_id, weight FROM (
                 SELECT key, entity_id, weight,
                     ROW_NUMBER() OVER (
-                        PARTITION BY key ORDER BY bucket_sample_hash(key, entity_id)
+                        PARTITION BY key ORDER BY retention_priority, entity_id
                     ) AS position
                 FROM block_keys
             ) WHERE position <= ?
@@ -271,7 +335,10 @@ class BlockingStore:
                 country, name, core, sorted_core, address, numbers = self._derived(row)
                 target_rows.append((entity_id, country, name, core, sorted_core, address, numbers))
                 rare_tokens = self._rare_tokens(core)
-                key_rows.extend((entity_id, key, weight) for key, weight in self._keys(country, name, core, sorted_core, address, numbers, rare_tokens))
+                rare_address_tokens = self._rare_address_tokens(address)
+                key_rows.extend((entity_id, key, weight) for key, weight in self._keys(
+                    country, name, core, sorted_core, address, numbers, rare_tokens, rare_address_tokens,
+                ))
                 count += 1
                 if count % 20_000 == 0:
                     self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?)", target_rows)
@@ -344,24 +411,24 @@ class BlockingStore:
                 SELECT source1_id, target_id, evidence, similarity,
                        ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS rank,
                        COUNT(*) OVER (PARTITION BY source1_id) AS candidate_count,
-                       FIRST_VALUE(similarity) OVER (
-                           PARTITION BY source1_id ORDER BY similarity DESC, target_id
-                       ) AS source_best_similarity,
                        LEAD(similarity) OVER (
                            PARTITION BY source1_id ORDER BY similarity DESC, target_id
                        ) AS next_similarity
                 FROM pruned
             ), ranked AS (
-                SELECT source1_id, target_id, evidence, similarity, rank,
-                       CASE WHEN rank = 1 THEN similarity - COALESCE(next_similarity, 0.0)
-                            ELSE similarity - source_best_similarity END AS score_margin,
+                SELECT source1_id, target_id, evidence, similarity, rank, candidate_count,
+                       similarity - COALESCE(next_similarity, 0.0) AS score_margin,
                        CASE WHEN candidate_count <= 1 THEN 1.0
                             ELSE 1.0 - CAST(rank - 1 AS REAL) / (candidate_count - 1) END AS rank_percentile,
-                       ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY similarity DESC, source1_id) AS target_rank
+                       ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY similarity DESC, source1_id) AS target_rank,
+                       COUNT(*) OVER (PARTITION BY target_id) AS target_candidate_count
                 FROM source_ranked
             )
             SELECT source1_id, target_id, evidence, similarity, rank, score_margin, rank_percentile,
-                   CASE WHEN rank = 1 AND target_rank = 1 THEN 1.0 ELSE 0.0 END AS reciprocal_best_match
+                   CASE WHEN rank = 1 AND target_rank = 1 THEN 1.0 ELSE 0.0 END AS reciprocal_best_match,
+                   candidate_count AS source_candidate_count,
+                   CASE WHEN target_candidate_count <= 1 THEN 1.0
+                        ELSE 1.0 - CAST(target_rank - 1 AS REAL) / (target_candidate_count - 1) END AS target_rank_percentile
             FROM ranked
         """, (self.top_k,))
         self.connection.execute("CREATE UNIQUE INDEX final_pair ON final_candidates(source1_id, target_id)")
@@ -394,6 +461,7 @@ class BlockingStore:
             SELECT c.source1_id, c.target_id, s.country, s.name, s.core, s.sorted_core, s.address, s.numbers,
                    t.country, t.name, t.core, t.sorted_core, t.address, t.numbers,
                    c.evidence, c.similarity, c.rank, c.score_margin, c.reciprocal_best_match, c.rank_percentile,
+                   c.source_candidate_count, c.target_rank_percentile,
                    CASE WHEN truth.target_id IS NULL THEN 0 ELSE 1 END
             FROM final_candidates c
             JOIN source1 s ON s.entity_id=c.source1_id
