@@ -5,6 +5,7 @@ import csv
 import hashlib
 import logging
 import sqlite3
+import time
 import zlib
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -70,6 +71,7 @@ class BlockingStore:
         self.connection.execute("PRAGMA cache_size=-200000")
         self._rare_token_cache: dict[str, bool] = {}
         self._rare_token_set: set[str] | None = None
+        self.diagnostics: dict = {}
 
     def close(self) -> None:
         self.connection.close()
@@ -132,8 +134,8 @@ class BlockingStore:
         padded = f"  {value}  "
         return {padded[index:index + 3] for index in range(max(0, len(padded) - 2))}
 
-    def _lsh_keys(self, core: str) -> list[str]:
-        grams = self._grams(core)
+    def _lsh_keys(self, text: str, prefix: str = "lsh") -> list[str]:
+        grams = self._grams(text)
         if len(grams) < 3:
             return []
         # Vectorized universal-hash MinHash.  It has the same deterministic
@@ -143,7 +145,7 @@ class BlockingStore:
         values = np.min((hashes[:, None] * self._MINHASH_A + self._MINHASH_B) % self._MINHASH_PRIME, axis=0)
         band_size = self.MINHASH_PERMUTATIONS // self.MINHASH_BANDS
         return [
-            f"lsh:{band}:{hashlib.blake2b(values[band * band_size:(band + 1) * band_size].tobytes(), digest_size=8).hexdigest()}"
+            f"{prefix}:{band}:{hashlib.blake2b(values[band * band_size:(band + 1) * band_size].tobytes(), digest_size=8).hexdigest()}"
             for band in range(self.MINHASH_BANDS)
         ]
 
@@ -173,6 +175,7 @@ class BlockingStore:
         keys.extend((f"phonetic:{self._soundex(token)}", 2.0)
                     for token in rare_tokens if self._soundex(token))
         keys.extend((key, 1.5) for key in self._lsh_keys(core))
+        keys.extend((key, 1.0) for key in self._lsh_keys(address, prefix="addr_lsh"))
         return [key for key in keys if key is not None]
 
     def _rare_tokens(self, core: str) -> Iterator[str]:
@@ -250,13 +253,27 @@ class BlockingStore:
         return count
 
     def _bound_keys(self) -> None:
-        """Retain deterministic capped buckets while preserving exact composites."""
+        """Retain deterministic capped buckets, prioritising entities with fewer retrieval paths.
+
+        Entities that have fewer total blocking keys are kept first in overloaded
+        buckets because they have fewer alternative chances of being retrieved.
+        This replaces the former ``ORDER BY entity_id`` which arbitrarily kept
+        only the alphabetically-first entries.
+        """
+        self.connection.execute("CREATE INDEX IF NOT EXISTS tmp_bk_eid ON block_keys(entity_id)")
         self.connection.execute("""
             CREATE TABLE bounded_keys AS
+            WITH entity_key_counts AS (
+                SELECT entity_id, COUNT(*) AS key_count FROM block_keys GROUP BY entity_id
+            )
             SELECT key, entity_id, weight FROM (
-                SELECT key, entity_id, weight,
-                    ROW_NUMBER() OVER (PARTITION BY key ORDER BY entity_id) AS position
-                FROM block_keys
+                SELECT bk.key, bk.entity_id, bk.weight,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bk.key
+                        ORDER BY ekc.key_count ASC, bk.entity_id
+                    ) AS position
+                FROM block_keys bk
+                JOIN entity_key_counts ekc ON ekc.entity_id = bk.entity_id
             ) WHERE position <= ? OR key LIKE 'full_composite:%'
         """, (self.key_cap,))
         self.connection.execute("CREATE INDEX bounded_keys_key ON bounded_keys(key)")
@@ -311,17 +328,53 @@ class BlockingStore:
             LOGGER.info("Retrieved blocking candidates from %s (%d targets)", Path(path).name, count)
 
     def finalize_candidates(self) -> int:
-        """Use C-accelerated RapidFuzz scores after an evidence-only short list."""
+        """Source-balanced shortlist, C-accelerated RapidFuzz rerank, per-stage diagnostics."""
         from rapidfuzz import fuzz, process
+        diagnostics: dict = {}
+        has_truth = self._has_truth()
+
+        # ── Stage 1: raw candidates diagnostics ──
+        if has_truth:
+            raw_r, raw_hit, raw_tot = self._recall_on_table("raw_candidates")
+            diagnostics["raw_blocking"] = {"recall": raw_r, "retrieved": raw_hit, "total": raw_tot}
+        raw_stats = self._candidate_stats("raw_candidates")
+        diagnostics["raw_stats"] = raw_stats
+        LOGGER.info("Raw candidates: %d pairs, %.1f avg/entity, recall=%.4f%%",
+                    raw_stats["total_pairs"], raw_stats["avg_candidates"],
+                    100 * diagnostics.get("raw_blocking", {}).get("recall", 0))
+
+        # ── Stage 2: source-balanced evidence shortlist ──
+        # Keep top 4*K globally, PLUS ensure at least top K from each source.
+        # This prevents Source-2 from consuming the entire candidate budget.
+        t0 = time.perf_counter()
         self.connection.execute("""
             CREATE TABLE shortlist AS
             SELECT source1_id, target_id, evidence FROM (
                 SELECT source1_id, target_id, evidence,
-                    ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY evidence DESC, target_id) AS position
+                    ROW_NUMBER() OVER (
+                        PARTITION BY source1_id ORDER BY evidence DESC, target_id
+                    ) AS global_pos,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY source1_id,
+                                     CASE WHEN target_id LIKE 'S2-%' THEN 2 ELSE 3 END
+                        ORDER BY evidence DESC, target_id
+                    ) AS source_pos
                 FROM raw_candidates
-            ) WHERE position <= ?
-        """, (self.top_k * 3,))
+            ) WHERE global_pos <= ? OR source_pos <= ?
+        """, (self.top_k * 4, self.top_k))
         self.connection.execute("ALTER TABLE shortlist ADD COLUMN similarity REAL")
+        if has_truth:
+            sl_r, sl_hit, sl_tot = self._recall_on_table("shortlist")
+            diagnostics["shortlist"] = {"recall": sl_r, "retrieved": sl_hit, "total": sl_tot}
+        sl_stats = self._candidate_stats("shortlist")
+        diagnostics["shortlist_stats"] = sl_stats
+        LOGGER.info("Shortlist: %d pairs, %.1f avg/entity (%.1fs), recall=%.4f%%",
+                    sl_stats["total_pairs"], sl_stats["avg_candidates"],
+                    time.perf_counter() - t0,
+                    100 * diagnostics.get("shortlist", {}).get("recall", 0))
+
+        # ── Stage 3: RapidFuzz reranking ──
+        t0 = time.perf_counter()
         reader = self.connection.execute("""
             SELECT c.source1_id, c.target_id, s.core, s.address, t.core, t.address, c.evidence
             FROM shortlist c JOIN source1 s ON s.entity_id=c.source1_id JOIN targets t ON t.entity_id=c.target_id
@@ -340,6 +393,9 @@ class BlockingStore:
                 update_rows.clear(); self.connection.commit()
         if update_rows:
             self.connection.executemany("UPDATE shortlist SET similarity=? WHERE source1_id=? AND target_id=?", update_rows)
+        LOGGER.info("RapidFuzz reranking: %.1fs", time.perf_counter() - t0)
+
+        # ── Stage 4: Final bounded candidates ──
         self.connection.execute("""
             CREATE TABLE final_candidates AS
             SELECT source1_id, target_id, evidence, similarity,
@@ -351,7 +407,18 @@ class BlockingStore:
         self.connection.execute("DROP TABLE shortlist")
         self.connection.execute("DROP TABLE raw_candidates")
         self.connection.commit()
-        return self.connection.execute("SELECT COUNT(*) FROM final_candidates").fetchone()[0]
+
+        if has_truth:
+            fin_r, fin_hit, fin_tot = self._recall_on_table("final_candidates")
+            diagnostics["final"] = {"recall": fin_r, "retrieved": fin_hit, "total": fin_tot}
+        fin_stats = self._candidate_stats("final_candidates")
+        diagnostics["final_stats"] = fin_stats
+        LOGGER.info("Final candidates: %d pairs, %.1f avg/entity, recall=%.4f%%",
+                    fin_stats["total_pairs"], fin_stats["avg_candidates"],
+                    100 * diagnostics.get("final", {}).get("recall", 0))
+
+        self.diagnostics = diagnostics
+        return fin_stats["total_pairs"]
 
     def recall_ceiling(self, where: str = "", parameters: Sequence[object] = ()) -> tuple[float, int, int]:
         predicate = f"WHERE {where}" if where else ""
@@ -405,3 +472,36 @@ class BlockingStore:
 
     def _has_probability(self) -> bool:
         return any(row[1] == "probability" for row in self.connection.execute("PRAGMA table_info(final_candidates)"))
+
+    def _has_truth(self) -> bool:
+        """Check if the truth table has any rows."""
+        return self.connection.execute("SELECT COUNT(*) FROM truth").fetchone()[0] > 0
+
+    def _recall_on_table(self, table: str, where: str = "", parameters: Sequence[object] = ()) -> tuple[float, int, int]:
+        """Measure recall of truth pairs present in the given candidate table."""
+        predicate = f"WHERE {where}" if where else ""
+        total = self.connection.execute(
+            f"SELECT COUNT(*) FROM truth t JOIN source1 s ON s.entity_id=t.source1_id {predicate}", parameters
+        ).fetchone()[0]
+        retrieved = self.connection.execute(
+            f"SELECT COUNT(*) FROM truth t JOIN {table} c ON c.source1_id=t.source1_id AND c.target_id=t.target_id "
+            f"JOIN source1 s ON s.entity_id=t.source1_id {predicate}", parameters
+        ).fetchone()[0]
+        return (retrieved / total if total else 1.0), retrieved, total
+
+    def _candidate_stats(self, table: str) -> dict:
+        """Compute candidate count distribution statistics."""
+        counts = [r[0] for r in self.connection.execute(
+            f"SELECT COUNT(*) FROM {table} GROUP BY source1_id ORDER BY COUNT(*)")]
+        if not counts:
+            return {"total_pairs": 0, "avg_candidates": 0.0, "median_candidates": 0,
+                    "p90_candidates": 0, "p95_candidates": 0, "max_candidates": 0}
+        n = len(counts)
+        return {
+            "total_pairs": sum(counts),
+            "avg_candidates": sum(counts) / n,
+            "median_candidates": counts[n // 2],
+            "p90_candidates": counts[min(int(n * 0.9), n - 1)],
+            "p95_candidates": counts[min(int(n * 0.95), n - 1)],
+            "max_candidates": counts[-1],
+        }

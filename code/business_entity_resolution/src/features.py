@@ -21,6 +21,11 @@ FEATURE_NAMES = [
     "name_token_jaccard", "name_token_overlap", "address_token_jaccard", "address_token_overlap",
     "address_number_jaccard", "first_number_match", "name_length_ratio", "address_length_ratio",
     "candidate_rank", "blocking_similarity",
+    # Missingness, source, and structural features
+    "name_missing_left", "name_missing_right", "address_missing_left", "address_missing_right",
+    "target_source", "legal_suffix_agree", "legal_suffix_conflict",
+    "name_token_count_diff", "core_token_count_diff",
+    "country_both_missing", "country_conflict",
 ]
 
 _CHAR_TRIGRAMS = HashingVectorizer(
@@ -86,6 +91,11 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     number_jaccard, first_number_match = _number_scores(s_numbers, t_numbers)
     s_name_len, t_name_len = np.asarray([len(value) for value in s_name]), np.asarray([len(value) for value in t_name])
     s_addr_len, t_addr_len = np.asarray([len(value) for value in s_address]), np.asarray([len(value) for value in t_address])
+    # Legal suffix: difference between normalized name and core name
+    s_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, '', 1).strip()
+                for n, c in zip(s_name, s_core)]
+    t_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, '', 1).strip()
+                for n, c in zip(t_name, t_core)]
     return np.column_stack((
         np.asarray([bool(a) and a == b for a, b in zip(s_name, t_name)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_core, t_core)], dtype=np.float32),
@@ -99,6 +109,24 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
         np.minimum(s_name_len, t_name_len) / np.maximum(np.maximum(s_name_len, t_name_len), 1),
         np.minimum(s_addr_len, t_addr_len) / np.maximum(np.maximum(s_addr_len, t_addr_len), 1),
         np.asarray(rank, dtype=np.float32), np.asarray(similarity, dtype=np.float32),
+        # ── Missingness features ──
+        np.asarray([not a for a in s_name], dtype=np.float32),
+        np.asarray([not a for a in t_name], dtype=np.float32),
+        np.asarray([not a for a in s_address], dtype=np.float32),
+        np.asarray([not a for a in t_address], dtype=np.float32),
+        # ── Target source (2=S2, 3=S3) ──
+        np.asarray([3.0 if tid.startswith('S3-') else 2.0 for tid in columns[1]], dtype=np.float32),
+        # ── Legal suffix agreement / conflict ──
+        np.asarray([bool(a) and a == b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
+        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
+        # ── Token count differences ──
+        np.abs(np.asarray([len(a.split()) for a in s_name], dtype=np.float32) -
+               np.asarray([len(a.split()) for a in t_name], dtype=np.float32)),
+        np.abs(np.asarray([len(a.split()) for a in s_core], dtype=np.float32) -
+               np.asarray([len(a.split()) for a in t_core], dtype=np.float32)),
+        # ── Refined country features ──
+        np.asarray([not a and not b for a, b in zip(s_country, t_country)], dtype=np.float32),
+        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_country, t_country)], dtype=np.float32),
     )).astype(np.float32, copy=False)
 
 

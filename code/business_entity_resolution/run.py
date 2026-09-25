@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 try:  # Supports both ``python run.py`` from this directory and module execution.
@@ -11,6 +12,7 @@ except ImportError:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
     parser = argparse.ArgumentParser(description="Business entity resolution pipeline")
     parser.add_argument("--mode", choices=("validate", "predict"), required=True)
     parser.add_argument("--data_dir", default="dataset/train", help="Directory with train_source*.tsv and ground truth")

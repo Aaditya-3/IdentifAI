@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -38,16 +39,21 @@ def _dataset_paths(directory: str | Path, split: str) -> tuple[Path, Path, Path]
 
 
 def _build_store(data_dir: str | Path, split: str, database: Path, top_k: int, with_truth: bool) -> BlockingStore:
+    t_start = time.perf_counter()
     source1, source2, source3 = _dataset_paths(data_dir, split)
     store = BlockingStore(database, top_k=top_k)
     store.reset()
     source_count = store.build_source_index(source1)
+    LOGGER.info("Source-1 index: %d records (%.1fs)", source_count, time.perf_counter() - t_start)
     if with_truth:
         store.add_truth(Path(data_dir) / "train_ground_truth.tsv")
+    t_ret = time.perf_counter()
     store.add_targets_and_retrieve((source2, source3))
+    LOGGER.info("Target retrieval: %.1fs", time.perf_counter() - t_ret)
     pair_count = store.finalize_candidates()
     candidates, average = store.candidate_summary()
-    LOGGER.info("Blocking complete: %d Source-1 records, %d final pairs, %.3f candidates/entity", source_count, candidates, average)
+    LOGGER.info("Blocking complete: %d Source-1 records, %d final pairs, %.3f candidates/entity (%.1fs total)",
+                source_count, candidates, average, time.perf_counter() - t_start)
     if with_truth:
         recall, retrieved, total = store.recall_ceiling()
         LOGGER.info("Blocking Recall Ceiling: %.4f%% (%d/%d)", 100 * recall, retrieved, total)
@@ -197,29 +203,62 @@ def _write_errors(store: BlockingStore, path: Path, threshold: float, where: str
 
 def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir: str | Path = "scratch") -> tuple[float, float]:
     """Run country-OOD and singleton-stratified checks on the real training data."""
+    t_total = time.perf_counter()
     scratch = Path(scratch_dir); scratch.mkdir(parents=True, exist_ok=True)
     store = _build_store(data_dir, "train", scratch / "train_validation.sqlite", top_k, with_truth=True)
     train_country, validation_country = _countries(store)
     LOGGER.info("Country holdout: train=%s, validation=%s", train_country, validation_country)
+
+    # ── Country OOD: train→validation ──
+    t0 = time.perf_counter()
     fit = _materialize(store, scratch, "country_fit", "s.country=?", (train_country,))
     valid = _materialize(store, scratch, "country_valid", "s.country=?", (validation_country,))
+    LOGGER.info("Feature materialization: %.1fs", time.perf_counter() - t0)
     selected, country_score, country_threshold, weight_results = _select_model(
         store, fit, valid, "s.country=?", (validation_country,), seed,
     )
     _write_errors(store, scratch / "country_holdout_errors.csv", country_threshold, "s.country=?", (validation_country,))
 
+    # ── Country OOD: reverse direction (validation→train) ──
+    rev_fit = _materialize(store, scratch, "country_rev_fit", "s.country=?", (validation_country,))
+    rev_valid = _materialize(store, scratch, "country_rev_valid", "s.country=?", (train_country,))
+    _, rev_class_weight, rev_scale_pos_weight = selected
+    rev_model = PairModel(seed, class_weight=rev_class_weight, scale_pos_weight=rev_scale_pos_weight).fit(rev_fit.x(), rev_fit.y())
+    _predict_to_store(rev_model, rev_valid, store)
+    rev_score, rev_threshold = _tune_threshold(store, "s.country=?", (train_country,))
+    LOGGER.info("Reverse OOD (%s→%s): macro F0.5=%.6f (threshold=%.2f)",
+                validation_country, train_country, rev_score, rev_threshold)
+
+    # ── In-distribution split ──
     in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", ())
     in_valid = _materialize(store, scratch, "id_valid", "s.split=0", ())
     _, class_weight, scale_pos_weight = selected
     in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
     _predict_to_store(in_model, in_valid, store)
     in_score, in_threshold = _tune_threshold(store, "s.split=0", ())
-    report = {"country_holdout": {"train_country": train_country, "validation_country": validation_country, "macro_f0_5": country_score, "threshold": country_threshold},
-              "in_distribution": {"macro_f0_5": in_score, "threshold": in_threshold},
-              "model_selection": {"selected": selected[0], "country_holdout_ablation": weight_results},
-              "blocking": {"recall": store.recall_ceiling()[0], "candidate_pairs": store.candidate_summary()[0], "average_candidates": store.candidate_summary()[1]}}
+
+    report = {
+        "country_holdout": {
+            "train_country": train_country, "validation_country": validation_country,
+            "macro_f0_5": country_score, "threshold": country_threshold,
+        },
+        "reverse_country_holdout": {
+            "train_country": validation_country, "validation_country": train_country,
+            "macro_f0_5": rev_score, "threshold": rev_threshold,
+        },
+        "in_distribution": {"macro_f0_5": in_score, "threshold": in_threshold},
+        "model_selection": {"selected": selected[0], "country_holdout_ablation": weight_results},
+        "blocking": {
+            "recall": store.recall_ceiling()[0],
+            "candidate_pairs": store.candidate_summary()[0],
+            "average_candidates": store.candidate_summary()[1],
+            "diagnostics": store.diagnostics,
+        },
+        "runtime_seconds": time.perf_counter() - t_total,
+    }
     (scratch / "validation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    LOGGER.info("Country OOD macro F0.5=%.6f (threshold=%.2f); in-distribution=%.6f (threshold=%.2f)", country_score, country_threshold, in_score, in_threshold)
+    LOGGER.info("Country OOD macro F0.5=%.6f (threshold=%.2f); reverse=%.6f; in-distribution=%.6f (threshold=%.2f)  [%.0fs]",
+                country_score, country_threshold, rev_score, in_score, in_threshold, time.perf_counter() - t_total)
     store.close()
     return country_score, country_threshold
 
