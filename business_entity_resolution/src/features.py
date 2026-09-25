@@ -1,273 +1,97 @@
-"""Pairwise lexical, structural, and semantic similarity features."""
+"""Batched lexical features for the bounded candidate set.
+
+No embedding model is used.  The former SentenceTransformer path could silently
+produce an all-zero feature without an offline model cache, so it was removed.
+"""
 from __future__ import annotations
 
-import math
-import re
-import warnings
-from difflib import SequenceMatcher
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Mapping, Sequence
+
+import numpy as np
+from rapidfuzz import fuzz, process
 
 from .data import Record
-from .preprocessing import (
-    normalize_name,
-    preprocess_record,
-    preprocess_records,
-)
+from .preprocessing import extract_address_numbers, core_name, normalize_address, normalize_name
 
-_SPACE = re.compile(r"\s+")
-_EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-_embedding_model = None
-_embedding_model_attempted = False
-_embedding_cache: dict[tuple[str, str], object] = {}
-
-
-def _raw_text(value: object) -> str:
-    return _SPACE.sub(" ", str(value or "").casefold()).strip()
-
-
-def _levenshtein_ratio(a: str, b: str) -> float:
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    if len(a) < len(b):
-        a, b = b, a
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        current = [i]
-        for j, cb in enumerate(b, 1):
-            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (ca != cb)))
-        previous = current
-    return 1.0 - previous[-1] / max(len(a), len(b))
-
-
-def _jaro_winkler(a: str, b: str) -> float:
-    if a == b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    radius = max(0, max(len(a), len(b)) // 2 - 1)
-    am, bm = [False] * len(a), [False] * len(b)
-    matches = 0
-    for i, char in enumerate(a):
-        for j in range(max(0, i - radius), min(i + radius + 1, len(b))):
-            if not bm[j] and char == b[j]:
-                am[i] = bm[j] = True
-                matches += 1
-                break
-    if not matches:
-        return 0.0
-    a_match = [a[i] for i in range(len(a)) if am[i]]
-    b_match = [b[i] for i in range(len(b)) if bm[i]]
-    transpositions = sum(x != y for x, y in zip(a_match, b_match)) / 2
-    jaro = (matches / len(a) + matches / len(b) + (matches - transpositions) / matches) / 3
-    prefix = 0
-    for x, y in zip(a[:4], b[:4]):
-        if x != y:
-            break
-        prefix += 1
-    return jaro + prefix * 0.1 * (1 - jaro)
-
-
-def _lcs_ratio(a: str, b: str) -> float:
-    """Normalized longest common subsequence length using linear memory."""
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    if len(b) > len(a):
-        a, b = b, a
-    previous = [0] * (len(b) + 1)
-    for ca in a:
-        current = [0]
-        for j, cb in enumerate(b, 1):
-            current.append(previous[j - 1] + 1 if ca == cb else max(previous[j], current[-1]))
-        previous = current
-    return previous[-1] / max(len(a), len(b))
-
-
-def _substring_ratio(a: str, b: str) -> float:
-    """Normalized longest common contiguous substring length."""
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    if len(b) > len(a):
-        a, b = b, a
-    previous = [0] * (len(b) + 1)
-    longest = 0
-    for ca in a:
-        current = [0]
-        for j, cb in enumerate(b, 1):
-            length = previous[j - 1] + 1 if ca == cb else 0
-            current.append(length)
-            longest = max(longest, length)
-        previous = current
-    return longest / max(len(a), len(b))
-
-
-def _token_features(a: str, b: str, prefix: str, features: dict) -> None:
-    ta, tb = set(a.split()), set(b.split())
-    union = ta | tb
-    features[prefix + "_jaccard"] = len(ta & tb) / len(union) if union else 1.0
-    features[prefix + "_overlap"] = float(len(ta & tb))
-
-
-def _embedding_key(record: Mapping[str, object]) -> tuple[str, str]:
-    text = normalize_name(record.get("business_name", ""))
-    entity_id = str(record.get("entity_id", ""))
-    return (entity_id, text) if entity_id else (text, text)
-
-
-def _get_embedding_model():
-    global _embedding_model, _embedding_model_attempted
-    if _embedding_model_attempted:
-        return _embedding_model
-    _embedding_model_attempted = True
-    try:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(_EMBEDDING_MODEL_NAME)
-    except Exception as exc:
-        warnings.warn(
-            f"Semantic embeddings unavailable ({exc}); name_embedding_cosine will be 0.0.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _embedding_model = None
-    return _embedding_model
-
-
-def _cache_embeddings(records: Sequence[Mapping[str, object]]) -> None:
-    missing: dict[tuple[str, str], str] = {}
-    for record in records:
-        key = _embedding_key(record)
-        if key not in _embedding_cache:
-            missing[key] = key[1]
-    for key, text in tuple(missing.items()):
-        if not text:
-            _embedding_cache[key] = None
-            del missing[key]
-    if not missing:
-        return
-    model = _get_embedding_model()
-    if model is None:
-        for key in missing:
-            _embedding_cache[key] = None
-        return
-    try:
-        vectors = model.encode(list(missing.values()), convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-        for key, vector in zip(missing, vectors):
-            _embedding_cache[key] = vector
-    except Exception as exc:
-        warnings.warn(
-            f"Semantic embedding failed ({exc}); affected cosine features will be 0.0.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        for key in missing:
-            _embedding_cache[key] = None
-
-
-def _embedding_similarity(left: Mapping[str, object], right: Mapping[str, object]) -> float:
-    _cache_embeddings((left, right))
-    a = _embedding_cache.get(_embedding_key(left))
-    b = _embedding_cache.get(_embedding_key(right))
-    if a is None or b is None:
-        return 0.0
-    try:
-        similarity = float(a @ b)
-        return max(-1.0, min(1.0, similarity)) if math.isfinite(similarity) else 0.0
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -> Dict[str, float]:
-    derived = {
-        "business_name_normalized", "business_name_core",
-        "business_address_normalized", "business_address_numbers",
-    }
-    left_fields = left if derived.issubset(left) else preprocess_record(left)
-    right_fields = right if derived.issubset(right) else preprocess_record(right)
-    name_a, name_b = left_fields["business_name_normalized"], right_fields["business_name_normalized"]
-    core_a, core_b = left_fields["business_name_core"], right_fields["business_name_core"]
-    address_a, address_b = left_fields["business_address_normalized"], right_fields["business_address_normalized"]
-    raw_name_a, raw_name_b = _raw_text(left.get("business_name", "")), _raw_text(right.get("business_name", ""))
-    raw_address_a, raw_address_b = _raw_text(left.get("business_address", "")), _raw_text(right.get("business_address", ""))
-    source_name_a, source_name_b = str(left.get("business_name", "") or ""), str(right.get("business_name", "") or "")
-    source_address_a, source_address_b = str(left.get("business_address", "") or ""), str(right.get("business_address", "") or "")
-    numbers_a = left_fields["business_address_numbers"]
-    numbers_b = right_fields["business_address_numbers"]
-
-    features: Dict[str, float] = {
-        "name_exact": float(bool(name_a) and name_a == name_b),
-        "name_exact_raw": float(bool(source_name_a) and source_name_a == source_name_b),
-        "name_exact_core": float(bool(core_a) and core_a == core_b),
-        "address_exact": float(bool(address_a) and address_a == address_b),
-        "address_exact_raw": float(bool(source_address_a) and source_address_a == source_address_b),
-        "name_levenshtein": _levenshtein_ratio(name_a, name_b),
-        "name_levenshtein_raw": _levenshtein_ratio(raw_name_a, raw_name_b),
-        "name_levenshtein_core": _levenshtein_ratio(core_a, core_b),
-        "address_levenshtein": _levenshtein_ratio(address_a, address_b),
-        "name_jaro_winkler": _jaro_winkler(name_a, name_b),
-        "name_jaro_winkler_raw": _jaro_winkler(raw_name_a, raw_name_b),
-        "name_jaro_winkler_core": _jaro_winkler(core_a, core_b),
-        "name_sequence": SequenceMatcher(None, name_a, name_b).ratio(),
-        "address_sequence": SequenceMatcher(None, address_a, address_b).ratio(),
-        "name_lcs_ratio": _lcs_ratio(name_a, name_b),
-        "name_substring_ratio": _substring_ratio(name_a, name_b),
-        "address_lcs_ratio": _lcs_ratio(address_a, address_b),
-        "address_substring_ratio": _substring_ratio(address_a, address_b),
-        "name_length_ratio": min(len(name_a), len(name_b)) / max(len(name_a), len(name_b), 1),
-        "address_length_ratio": min(len(address_a), len(address_b)) / max(len(address_a), len(address_b), 1),
-        "address_number_match": 0.5 if not numbers_a or not numbers_b else float(numbers_a == numbers_b),
-        "name_embedding_cosine": _embedding_similarity(left, right),
-        "country_match": float(bool(_raw_text(left.get("country", ""))) and _raw_text(left.get("country", "")) == _raw_text(right.get("country", ""))),
-        "candidate_rank": _finite_float(retrieval.get("rank", 0.0)),
-        "blocking_similarity": _finite_float(retrieval.get("similarity", 0.0)),
-    }
-    _token_features(raw_name_a, raw_name_b, "name_raw", features)
-    _token_features(name_a, name_b, "name", features)
-    _token_features(core_a, core_b, "name_core", features)
-    _token_features(raw_address_a, raw_address_b, "address_raw", features)
-    _token_features(address_a, address_b, "address", features)
-    return {key: _finite_float(value) for key, value in features.items()}
-
-
-def _finite_float(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
-    return number if math.isfinite(number) else 0.0
-
-
-_FEATURE_NAMES = [
-    "name_exact", "name_exact_raw", "name_exact_core", "address_exact", "address_exact_raw",
-    "name_levenshtein", "name_levenshtein_raw", "name_levenshtein_core", "address_levenshtein",
-    "name_jaro_winkler", "name_jaro_winkler_raw", "name_jaro_winkler_core",
-    "name_raw_jaccard", "name_raw_overlap", "name_jaccard", "name_overlap",
-    "name_core_jaccard", "name_core_overlap", "address_raw_jaccard", "address_raw_overlap",
-    "address_jaccard", "address_overlap", "name_sequence", "address_sequence",
-    "name_lcs_ratio", "name_substring_ratio", "address_lcs_ratio", "address_substring_ratio",
-    "name_length_ratio", "address_length_ratio", "address_number_match", "name_embedding_cosine",
-    "country_match", "candidate_rank", "blocking_similarity",
+FEATURE_NAMES = [
+    "name_exact", "core_exact", "sorted_core_exact", "address_exact", "country_match",
+    "name_ratio", "core_ratio", "address_ratio", "name_token_jaccard", "name_token_overlap",
+    "address_token_jaccard", "address_token_overlap", "address_number_match", "name_length_ratio",
+    "address_length_ratio", "candidate_rank", "blocking_similarity",
 ]
 
 
-def feature_matrix(candidates: Mapping[Tuple[str, str], dict], source1: Sequence[Record], source2: Sequence[Record], source3: Sequence[Record]):
-    import numpy as np
-    left = {record["entity_id"]: record for record in preprocess_records(source1)}
-    right = {
-        record["entity_id"]: record
-        for record in preprocess_records((*source2, *source3))
-    }
-    _cache_embeddings(tuple(left.values()) + tuple(right.values()))
+def _tokens(value: str) -> set[str]:
+    return set(value.split())
+
+
+def _token_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+    jaccard, overlap = np.zeros(len(left), dtype=np.float32), np.zeros(len(left), dtype=np.float32)
+    for index, (a, b) in enumerate(zip(left, right)):
+        a_tokens, b_tokens = _tokens(a), _tokens(b)
+        union = a_tokens | b_tokens
+        jaccard[index] = len(a_tokens & b_tokens) / len(union) if union else 1.0
+        overlap[index] = len(a_tokens & b_tokens)
+    return jaccard, overlap
+
+
+def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
+    """Vectorize one DB batch; edit distances use RapidFuzz's C++ cpdist."""
+    if not rows:
+        return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
+    # (sid, tid, s_country, s_name, s_core, s_sorted, s_address, s_numbers,
+    #  t_country, t_name, t_core, t_sorted, t_address, t_numbers, evidence, similarity, rank)
+    columns = list(zip(*rows))
+    s_country, s_name, s_core, s_sorted, s_address, s_numbers = columns[2:8]
+    t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
+    evidence, similarity, rank = columns[14:17]
+    name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    address_ratio = process.cpdist(s_address, t_address, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+    name_jaccard, name_overlap = _token_scores(s_core, t_core)
+    address_jaccard, address_overlap = _token_scores(s_address, t_address)
+    s_name_len, t_name_len = np.asarray([len(value) for value in s_name]), np.asarray([len(value) for value in t_name])
+    s_addr_len, t_addr_len = np.asarray([len(value) for value in s_address]), np.asarray([len(value) for value in t_address])
+    return np.column_stack((
+        np.asarray([bool(a) and a == b for a, b in zip(s_name, t_name)], dtype=np.float32),
+        np.asarray([bool(a) and a == b for a, b in zip(s_core, t_core)], dtype=np.float32),
+        np.asarray([bool(a) and a == b for a, b in zip(s_sorted, t_sorted)], dtype=np.float32),
+        np.asarray([bool(a) and a == b for a, b in zip(s_address, t_address)], dtype=np.float32),
+        np.asarray([bool(a) and a == b for a, b in zip(s_country, t_country)], dtype=np.float32),
+        name_ratio, core_ratio, address_ratio, name_jaccard, name_overlap, address_jaccard, address_overlap,
+        np.asarray([0.5 if not a or not b else float(a == b) for a, b in zip(s_numbers, t_numbers)], dtype=np.float32),
+        np.minimum(s_name_len, t_name_len) / np.maximum(np.maximum(s_name_len, t_name_len), 1),
+        np.minimum(s_addr_len, t_addr_len) / np.maximum(np.maximum(s_addr_len, t_addr_len), 1),
+        np.asarray(rank, dtype=np.float32), np.asarray(similarity, dtype=np.float32),
+    )).astype(np.float32, copy=False)
+
+
+def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -> dict[str, float]:
+    """Compatibility helper for small diagnostics and unit tests."""
+    s_name, t_name = normalize_name(left.get("business_name", "")), normalize_name(right.get("business_name", ""))
+    s_core, t_core = core_name(left.get("business_name", "")), core_name(right.get("business_name", ""))
+    s_address, t_address = normalize_address(left.get("business_address", "")), normalize_address(right.get("business_address", ""))
+    s_sorted, t_sorted = " ".join(sorted(s_core.split())), " ".join(sorted(t_core.split()))
+    row = ("", "", str(left.get("country", "")).casefold(), s_name, s_core, s_sorted, s_address, extract_address_numbers(s_address),
+           str(right.get("country", "")).casefold(), t_name, t_core, t_sorted, t_address, extract_address_numbers(t_address),
+           0.0, float(retrieval.get("similarity", 0.0)), float(retrieval.get("rank", 0.0)))
+    return dict(zip(FEATURE_NAMES, feature_batch([row])[0].tolist()))
+
+
+def feature_matrix(candidates: Mapping[tuple[str, str], dict], source1: Sequence[Record], source2: Sequence[Record], source3: Sequence[Record]):
+    """Small-data compatibility API. Production uses feature_batch over SQLite rows."""
+    left = {record["entity_id"]: record for record in source1}
+    right = {record["entity_id"]: record for record in (*source2, *source3)}
     rows, pairs = [], []
-    for pair, retrieval in candidates.items():
-        if pair[0] not in left or pair[1] not in right:
+    for (source_id, target_id), retrieval in candidates.items():
+        if source_id not in left or target_id not in right:
             continue
-        features = pair_features(left[pair[0]], right[pair[1]], retrieval)
-        rows.append([features[name] for name in _FEATURE_NAMES])
-        pairs.append(pair)
-    matrix = np.asarray(rows, dtype=np.float32).reshape((-1, len(_FEATURE_NAMES)))
-    return matrix, pairs, list(_FEATURE_NAMES)
+        s, t = left[source_id], right[target_id]
+        s_name, t_name = normalize_name(s.get("business_name", "")), normalize_name(t.get("business_name", ""))
+        s_core, t_core = core_name(s.get("business_name", "")), core_name(t.get("business_name", ""))
+        s_address, t_address = normalize_address(s.get("business_address", "")), normalize_address(t.get("business_address", ""))
+        rows.append((source_id, target_id, str(s.get("country", "")).casefold(), s_name, s_core, " ".join(sorted(s_core.split())), s_address, extract_address_numbers(s_address),
+                     str(t.get("country", "")).casefold(), t_name, t_core, " ".join(sorted(t_core.split())), t_address, extract_address_numbers(t_address),
+                     0.0, retrieval.get("similarity", 0.0), retrieval.get("rank", 0.0)))
+        pairs.append((source_id, target_id))
+    return feature_batch(rows), pairs, list(FEATURE_NAMES)

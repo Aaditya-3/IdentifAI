@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import sqlite3
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence, Set, Tuple
 
@@ -88,6 +89,44 @@ def write_submission(
     matching_path = output_dir / "matching_results.tsv"
     _write_grouped_tsv(candidate_path, "source1_entity_id", "candidate_entity_ids", candidate_ids, order)
     _write_grouped_tsv(matching_path, "source1_entity_id", "matched_entity_ids", prediction_ids, order)
+    return candidate_path, matching_path
+
+
+def write_submission_from_database(output_dir: str | Path, database: str | Path, threshold: float) -> Tuple[Path, Path]:
+    """Stream a submission from the canonical candidate store.
+
+    The ordered left join writes exactly one row per Source 1 entity without
+    materializing candidate lists in Python.  Predictions are selected only from
+    ``final_candidates``, which makes the subset invariant structural.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = output_dir / "candidate_pairs.tsv"
+    matching_path = output_dir / "matching_results.tsv"
+    connection = sqlite3.connect(database)
+    cursor = connection.execute("""
+        SELECT s.entity_id, c.target_id, COALESCE(c.probability, 0.0)
+        FROM source1 s LEFT JOIN final_candidates c ON c.source1_id=s.entity_id
+        ORDER BY s.entity_id, c.target_id
+    """)
+    with candidate_path.open("w", encoding="utf-8", newline="") as candidates, matching_path.open("w", encoding="utf-8", newline="") as matches:
+        candidates.write("source1_entity_id\tcandidate_entity_ids\n")
+        matches.write("source1_entity_id\tmatched_entity_ids\n")
+        current_id, candidate_ids, matched_ids = None, [], []
+        for source_id, target_id, probability in cursor:
+            if source_id != current_id:
+                if current_id is not None:
+                    candidates.write(f"{current_id}\t{','.join(candidate_ids)}\n")
+                    matches.write(f"{current_id}\t{','.join(matched_ids)}\n")
+                current_id, candidate_ids, matched_ids = source_id, [], []
+            if target_id:
+                candidate_ids.append(target_id)
+                if probability >= threshold:
+                    matched_ids.append(target_id)
+        if current_id is not None:
+            candidates.write(f"{current_id}\t{','.join(candidate_ids)}\n")
+            matches.write(f"{current_id}\t{','.join(matched_ids)}\n")
+    connection.close()
     return candidate_path, matching_path
 
 
