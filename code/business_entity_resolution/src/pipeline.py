@@ -163,17 +163,33 @@ def _model_options(labels: np.ndarray) -> list[tuple[str, str | None, float | No
 
 
 def _select_model(store: BlockingStore, fit: MatrixFiles, tune: MatrixFiles,
+                  in_fit: MatrixFiles, in_tune: MatrixFiles,
                   where: str, parameters: Sequence[object], seed: int) -> tuple[tuple[str, str | None, float | None], float, float, dict[str, dict[str, float]]]:
-    """Choose weighting only by country-OOD macro F0.5, then restore its scores."""
+    """Choose weighting by country-OOD macro F0.5, guarding against in-distribution regression."""
     results: dict[str, dict[str, float]] = {}
     best: tuple[str, str | None, float | None] | None = None
     best_score, best_threshold = -1.0, 0.995
+    baseline_id_score = None
     for option in _model_options(fit.y()):  # type: ignore[arg-type]
         name, class_weight, scale_pos_weight = option
         model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(fit.x(), fit.y())
         _predict_to_store(model, tune, store)
         score, threshold = _tune_threshold(store, where, parameters)
-        results[name] = {"macro_f0_5": score, "threshold": threshold}
+        
+        in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
+        _predict_to_store(in_model, in_tune, store)
+        id_score, _ = _tune_threshold(store, "s.split=0", ())
+        
+        if name == "unweighted":
+            baseline_id_score = id_score
+            
+        results[name] = {"macro_f0_5": score, "threshold": threshold, "id_macro_f0_5": id_score}
+        
+        # Guard against material regression (e.g., >0.005) on the main distribution
+        if baseline_id_score is not None and id_score < baseline_id_score - 0.005:
+            LOGGER.info("Rejecting %s: ID score %.6f regressed from baseline %.6f", name, id_score, baseline_id_score)
+            continue
+            
         if score > best_score or (score == best_score and threshold > best_threshold):
             best, best_score, best_threshold = option, score, threshold
     assert best is not None
@@ -213,9 +229,11 @@ def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir:
     t0 = time.perf_counter()
     fit = _materialize(store, scratch, "country_fit", "s.country=?", (train_country,))
     valid = _materialize(store, scratch, "country_valid", "s.country=?", (validation_country,))
+    in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", ())
+    in_valid = _materialize(store, scratch, "id_valid", "s.split=0", ())
     LOGGER.info("Feature materialization: %.1fs", time.perf_counter() - t0)
     selected, country_score, country_threshold, weight_results = _select_model(
-        store, fit, valid, "s.country=?", (validation_country,), seed,
+        store, fit, valid, in_fit, in_valid, "s.country=?", (validation_country,), seed,
     )
     _write_errors(store, scratch / "country_holdout_errors.csv", country_threshold, "s.country=?", (validation_country,))
 
@@ -230,8 +248,6 @@ def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir:
                 validation_country, train_country, rev_score, rev_threshold)
 
     # ── In-distribution split ──
-    in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", ())
-    in_valid = _materialize(store, scratch, "id_valid", "s.split=0", ())
     _, class_weight, scale_pos_weight = selected
     in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
     _predict_to_store(in_model, in_valid, store)
@@ -270,21 +286,29 @@ def predict(test_dir: str | Path, output_dir: str | Path, train_dir: str | Path,
     train_country, validation_country = _countries(train_store)
     fit = _materialize(train_store, scratch, "threshold_fit", "s.country=?", (train_country,))
     tune = _materialize(train_store, scratch, "threshold_tune", "s.country=?", (validation_country,))
-    selected, country_score, country_threshold, _ = _select_model(
-        train_store, fit, tune, "s.country=?", (validation_country,), seed,
-    )
+
     in_fit = _materialize(train_store, scratch, "predict_id_fit", "s.split<>0", ())
     in_tune = _materialize(train_store, scratch, "predict_id_tune", "s.split=0", ())
+    selected, country_score, country_threshold, _ = _select_model(
+        train_store, fit, tune, in_fit, in_tune, "s.country=?", (validation_country,), seed,
+    )
+    
+    rev_fit = _materialize(train_store, scratch, "predict_rev_fit", "s.country=?", (validation_country,))
+    rev_tune = _materialize(train_store, scratch, "predict_rev_tune", "s.country=?", (train_country,))
     _, class_weight, scale_pos_weight = selected
+    rev_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(rev_fit.x(), rev_fit.y())
+    _predict_to_store(rev_model, rev_tune, train_store)
+    _, rev_threshold = _tune_threshold(train_store, "s.country=?", (train_country,))
+    
     in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
     _predict_to_store(in_model, in_tune, train_store)
     in_score, in_threshold = _tune_threshold(train_store, "s.split=0", ())
-    # The country holdout is the OOD proxy for France.  Taking the more
-    # conservative of it and the independent in-distribution threshold retains
-    # that signal while protecting the precision-heavy singleton metric.
-    threshold = max(country_threshold, in_threshold)
-    LOGGER.info("Threshold policy: max(country-OOD %.3f, in-distribution %.3f) = %.3f; scores %.6f / %.6f",
-                country_threshold, in_threshold, threshold, country_score, in_score)
+    
+    # Take a bounded blend of the forward and reverse country-holdout thresholds
+    avg_country_threshold = (country_threshold + rev_threshold) / 2.0
+    threshold = max(avg_country_threshold, in_threshold)
+    LOGGER.info("Threshold policy: max(avg(OOD-fwd %.3f, OOD-rev %.3f), ID %.3f) = %.3f",
+                country_threshold, rev_threshold, in_threshold, threshold)
     full = _materialize(train_store, scratch, "full_train", labels=True)
     model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(full.x(), full.y())
     train_store.close()

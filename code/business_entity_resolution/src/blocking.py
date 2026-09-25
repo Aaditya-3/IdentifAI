@@ -349,18 +349,24 @@ class BlockingStore:
         t0 = time.perf_counter()
         self.connection.execute("""
             CREATE TABLE shortlist AS
-            SELECT source1_id, target_id, evidence FROM (
-                SELECT source1_id, target_id, evidence,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id ORDER BY evidence DESC, target_id
-                    ) AS global_pos,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id,
-                                     CASE WHEN target_id LIKE 'S2-%' THEN 2 ELSE 3 END
-                        ORDER BY evidence DESC, target_id
-                    ) AS source_pos
-                FROM raw_candidates
-            ) WHERE global_pos <= ? OR source_pos <= ?
+            WITH raw_filtered AS (
+                SELECT source1_id, target_id, evidence FROM (
+                    SELECT source1_id, target_id, evidence,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY source1_id ORDER BY evidence DESC, target_id
+                        ) AS global_pos,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY source1_id,
+                                         CASE WHEN target_id LIKE 'S2-%' THEN 2 ELSE 3 END
+                            ORDER BY evidence DESC, target_id
+                        ) AS source_pos
+                    FROM raw_candidates
+                ) WHERE global_pos <= ? OR source_pos <= ?
+            )
+            SELECT source1_id, target_id,
+                   COALESCE((evidence - MIN(evidence) OVER (PARTITION BY source1_id)) / 
+                            NULLIF(MAX(evidence) OVER (PARTITION BY source1_id) - MIN(evidence) OVER (PARTITION BY source1_id), 0), 1.0) AS evidence
+            FROM raw_filtered
         """, (self.top_k * 4, self.top_k))
         self.connection.execute("ALTER TABLE shortlist ADD COLUMN similarity REAL")
         if has_truth:
