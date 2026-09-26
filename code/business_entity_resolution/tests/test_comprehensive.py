@@ -12,7 +12,8 @@ from pathlib import Path
 from src.blocking import BlockingStore
 from src.features import FEATURE_NAMES, feature_batch
 from src.metrics import macro_f0_5
-from src.model import PairModel
+from src.model import LinearPairModel, PairModel, ProbabilityEnsemble
+from src.decision import choose_hysteresis_policy, apply_entity_policy
 from src.output import enforce_candidate_subset, group_candidates
 from src.preprocessing import (
     core_name, extract_address_numbers, normalize_address, normalize_name,
@@ -84,6 +85,14 @@ class TestPreprocessing(unittest.TestCase):
 
     def test_extract_numbers(self):
         self.assertEqual(extract_address_numbers("12 Main St Suite 400"), "12 400")
+
+    def test_extract_unit_number(self):
+        self.assertEqual(extract_address_numbers("221B Baker Street"), "221b")
+
+    def test_landmark_fillers_removed(self):
+        normalized = normalize_address("Near SBI ATM, 221B Baker Street")
+        self.assertNotIn("near", normalized.split())
+        self.assertIn("221b", normalized.split())
 
     def test_empty_name(self):
         self.assertEqual(normalize_name(""), "")
@@ -520,6 +529,32 @@ class TestModel(unittest.TestCase):
         result = model.predict_pairs(probs, pairs)
         self.assertEqual(result.get("S1-1", set()), {"S2-1", "S3-1"})
 
+
+    def test_linear_model_and_ensemble_interface(self):
+        import numpy as np
+        X = np.asarray([[0.0, 0.0], [1.0, 1.0], [0.2, 0.1], [0.9, 1.1]], dtype=np.float32)
+        y = np.asarray([0, 1, 0, 1], dtype=np.int8)
+        primary = PairModel(random_state=7).fit(X, y)
+        secondary = LinearPairModel(random_state=7).fit(X, y)
+        ensemble = ProbabilityEnsemble(primary, secondary).predict_proba(X)
+        self.assertEqual(ensemble.shape, (4,))
+        self.assertTrue(np.all((ensemble >= 0.0) & (ensemble <= 1.0)))
+
+class TestDecisionPolicy(unittest.TestCase):
+    def test_entity_policy_uses_group_margin(self):
+        policy = choose_hysteresis_policy(
+            0.80,
+            ambiguous_margin=0.05,
+            second_match_delta=0.05,
+            max_matches=4,
+        )
+        candidates = [
+            {"target_id": "S2-1", "probability": 0.95, "name_score": 0.98, "address_score": 0.95},
+            {"target_id": "S2-2", "probability": 0.82, "name_score": 0.80, "address_score": 0.60},
+        ]
+        selected = apply_entity_policy(candidates, policy)
+        self.assertIn("S2-1", selected)
+        self.assertNotIn("S2-2", selected)
 
 class TestDeterminism(unittest.TestCase):
     """Reproducibility."""

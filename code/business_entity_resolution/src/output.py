@@ -9,7 +9,8 @@ from typing import Callable, Iterable, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 from .data import Record
-from .features import feature_batch
+from .features import FEATURE_NAMES, feature_batch
+from .decision import DecisionPolicy, apply_entity_policy
 
 LOGGER = logging.getLogger(__name__)
 Pair = Tuple[str, str]
@@ -100,49 +101,107 @@ def write_submission_from_store_streaming(
     threshold_by_country: Mapping[str, float] | None = None,
     unseen_country_threshold: float | None = None,
     variation_model=None,
+    decision_policies_by_country: Mapping[str, DecisionPolicy] | None = None,
+    unseen_decision_policy: DecisionPolicy | None = None,
 ) -> tuple[Path, Path]:
-    """Run test inference and write both submission files with bounded memory.
+    """Run bounded test inference and write the exact required submission files.
 
-    Candidate rows are already ordered by Source-1/rank/target in the store.
-    Features and probabilities are computed batch-by-batch; neither the full
-    candidate feature matrix nor the full probability vector is materialized.
+    ``candidate_pairs.tsv`` is the exact final-candidate set in
+    ``final_candidates``.  Matching decisions are made entity-by-entity after all
+    candidates for an S1 have been scored, allowing the validated hysteresis
+    policy to use probability margins and pair evidence without changing the
+    candidate set itself.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_path = output_dir / "candidate_pairs.tsv"
     matching_path = output_dir / "matching_results.tsv"
 
-    s1_cursor = iter(store.connection.execute("SELECT entity_id, country FROM source1 ORDER BY entity_id"))
+    s1_cursor = iter(
+        store.connection.execute(
+            "SELECT entity_id, country FROM source1 ORDER BY entity_id"
+        )
+    )
     current = next(s1_cursor, None)
     current_sid = current[0] if current else None
     current_country = (current[1] or "").casefold() if current else ""
-    previous_sid = None
+
     current_candidates: list[str] = []
-    current_matches: list[str] = []
+    current_rows_for_policy: list[dict[str, object]] = []
     current_seen: set[str] = set()
     written = 0
     consumed_pairs = 0
 
-    def write_current(fc, fm):
-        nonlocal written, current_sid, current_candidates, current_matches, current_seen
+    idx_name = FEATURE_NAMES.index("name_ratio")
+    idx_address = FEATURE_NAMES.index("address_ratio")
+    idx_mutual = FEATURE_NAMES.index("mutual_best")
+    idx_bridge = FEATURE_NAMES.index("opposite_source_bridge")
+    idx_alias = FEATURE_NAMES.index("learned_name_alias")
+    idx_address_alias = FEATURE_NAMES.index("learned_address_alias")
+
+    def _policy_for_country(country: str) -> DecisionPolicy:
+        normalized = (country or "").casefold()
+        if decision_policies_by_country:
+            policy = decision_policies_by_country.get(normalized)
+            if policy is not None:
+                return policy
+        if unseen_decision_policy is not None:
+            return unseen_decision_policy
+        active_threshold = threshold
+        if threshold_by_country is not None:
+            active_threshold = float(
+                threshold_by_country.get(
+                    normalized,
+                    unseen_country_threshold
+                    if unseen_country_threshold is not None
+                    else threshold,
+                )
+            )
+        return DecisionPolicy(
+            high_threshold=active_threshold,
+            low_threshold=active_threshold,
+            ambiguous_margin=0.0,
+            second_match_delta=0.0,
+            max_matches=max(1, int(store.top_k)),
+            min_absolute_score=0.0,
+        )
+
+    def _write_current(fc, fm) -> None:
+        nonlocal written, current_candidates, current_rows_for_policy
         if current_sid is None:
             return
+
+        policy = _policy_for_country(current_country)
+        selected = apply_entity_policy(current_rows_for_policy, policy)
+        ordered_matches = [
+            row["target_id"]
+            for row in sorted(
+                current_rows_for_policy,
+                key=lambda row: (
+                    -float(row["probability"]),
+                    str(row["target_id"]),
+                ),
+            )
+            if str(row["target_id"]) in selected
+        ]
+
         fc.write(f"{current_sid}\t{','.join(current_candidates)}\n")
-        fm.write(f"{current_sid}\t{','.join(current_matches)}\n")
+        fm.write(f"{current_sid}\t{','.join(ordered_matches)}\n")
         written += 1
         current_candidates = []
-        current_matches = []
-        current_seen = set()
+        current_rows_for_policy = []
+        current_seen.clear()
 
-    def advance_to(fc, fm, sid: str) -> None:
-        nonlocal current_sid, current_country, previous_sid
+    def _advance_to(fc, fm, sid: str) -> None:
+        nonlocal current_sid, current_country
         while current_sid is not None and current_sid < sid:
-            write_current(fc, fm)
-            previous_sid = current_sid
+            _write_current(fc, fm)
             current = next(s1_cursor, None)
             current_sid = current[0] if current else None
             current_country = (current[1] or "").casefold() if current else ""
         if current_sid != sid:
-            raise AssertionError(f"Candidate stream contains unknown/unordered Source-1 ID: {sid}")
+            raise AssertionError(
+                f"Candidate stream contains unknown/unordered Source-1 ID: {sid}"
+            )
 
     cursor = store.feature_rows()
     with candidate_path.open("w", encoding="utf-8", newline="") as fc, \
@@ -160,44 +219,62 @@ def write_submission_from_store_streaming(
             if not batch:
                 break
 
-            probs = model.predict_proba(
-                feature_batch([row[:-1] for row in batch], variation_model=variation_model)
+            feature_matrix = feature_batch(
+                [row[:-1] for row in batch],
+                variation_model=variation_model,
             )
+            probs = model.predict_proba(feature_matrix)
             if len(probs) != len(batch):
-                raise AssertionError("Model probability count does not match feature batch size")
+                raise AssertionError(
+                    "Model probability count does not match feature batch size"
+                )
 
-            for row, prob in zip(batch, probs):
+            for row, prob, feature_vector in zip(batch, probs, feature_matrix):
                 sid, tid = row[0], row[1]
-                advance_to(fc, fm, sid)
+                _advance_to(fc, fm, sid)
+
                 if tid in current_seen:
-                    raise AssertionError(f"Duplicate candidate target {tid} for Source-1 {sid}")
+                    raise AssertionError(
+                        f"Duplicate candidate target {tid} for Source-1 {sid}"
+                    )
                 if tid.startswith("S1-"):
                     raise AssertionError(f"Invalid target Source-1 ID {tid}")
+
                 current_seen.add(tid)
                 current_candidates.append(tid)
-                active_threshold = float(threshold)
-                if threshold_by_country is not None:
-                    active_threshold = float(
-                        threshold_by_country.get(
-                            current_country,
-                            unseen_country_threshold if unseen_country_threshold is not None else threshold,
-                        )
-                    )
-                if float(prob) >= active_threshold:
-                    current_matches.append(tid)
+                current_rows_for_policy.append(
+                    {
+                        "target_id": tid,
+                        "probability": float(prob),
+                        "name_score": float(feature_vector[idx_name]),
+                        "address_score": float(feature_vector[idx_address]),
+                        "mutual_best": float(feature_vector[idx_mutual]),
+                        "opposite_source_bridge": float(feature_vector[idx_bridge]),
+                        "learned_name_alias": float(feature_vector[idx_alias]),
+                        "learned_address_alias": float(feature_vector[idx_address_alias]),
+                    }
+                )
                 consumed_pairs += 1
 
         while current_sid is not None:
-            write_current(fc, fm)
-            previous_sid = current_sid
+            _write_current(fc, fm)
             current = next(s1_cursor, None)
             current_sid = current[0] if current else None
+            current_country = (current[1] or "").casefold() if current else ""
 
-    expected_entities = store.connection.execute("SELECT COUNT(*) FROM source1").fetchone()[0]
+    expected_entities = store.connection.execute(
+        "SELECT COUNT(*) FROM source1"
+    ).fetchone()[0]
     if written != expected_entities:
-        raise AssertionError(f"Wrote {written} Source-1 rows, expected {expected_entities}")
+        raise AssertionError(
+            f"Wrote {written} Source-1 rows, expected {expected_entities}"
+        )
 
-    LOGGER.info("Streamed %d candidates and %d Source-1 rows directly to submission files", consumed_pairs, written)
+    LOGGER.info(
+        "Streamed %d candidates and %d Source-1 rows directly to submission files",
+        consumed_pairs,
+        written,
+    )
     return candidate_path, matching_path
 
 def write_submission_stream(

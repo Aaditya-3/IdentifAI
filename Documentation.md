@@ -1,70 +1,142 @@
-# ML Challenge 2026: Business Entity Resolution Solution
+Business Entity Resolution Challenge — Methodology
 
-**Team Name:** Antigravity  
-**Team Members:** Antigravity AI  
-**Submission Date:** Sept 2026
+Objective
 
----
+The pipeline resolves each Source-1 record to zero, one, or many Source-2/Source-3 records using only the supplied challenge data. The competition metric is macro F0.5 per Source-1 entity, with singleton entities included in the macro average.
 
-## 1. Executive Summary
-Our approach drastically improves recall in the blocking phase by replacing arbitrary alphabetic bucket truncation with a priority queue based on block key rarity, ensuring unique entities aren't displaced by common stop words. We further enriched the downstream LightGBM model with structured features representing missingness, target source, and legal suffixes to improve F0.5 precision and properly distinguish singleton entities from weak matches.
+Preprocessing
 
----
+Business names are Unicode-normalized, case-folded and legal-suffix canonicalized. The normalization covers common US/India forms and French legal suffixes such as SASU, SCI, SNC and EIRL.
 
-## 2. Methodology
+Addresses are normalized with deterministic street aliases and address aliases. Structured components include street number, street body, city when an explicit delimiter supports a conservative boundary, and postal code. Landmark filler terms such as “near”, “opposite”, “beside” and “next to” are removed from address text before comparison. No geocoder or external address database is used.
 
-### 2.1 Problem Analysis
-The problem formulation emphasizes high precision due to the F0.5 metric, and strictly penalizes merging distinct legal entities (false positives). Upon auditing the baseline, several critical weaknesses were identified:
-1. **Blocking Recall Bottleneck**: The SQLite grouping logic arbitrarily discarded candidates after 160 per bucket alphabetically by ID, effectively capping recall and randomly dropping valid pairs.
-2. **Feature Poverty**: LightGBM was fed raw similarity scores but lacked crucial metadata, like missingness indicators and explicit target-source markers, forcing it to guess the distributions.
-3. **Address Mismatches**: Heavy reliance on exact string matching for address fields left many fuzzy address similarities completely unretrieved.
+Blocking and candidate generation
 
-### 2.2 Solution Strategy
-**Approach Type:** Blocking + Classifier
-**Core Innovation:** Rarity-weighted blocking priority queues combined with feature engineering (missingness and legal suffixes) and out-of-distribution (OOD) threshold tuning.
+Blocking uses multiple independent retrieval paths:
 
----
+exact normalized full/core/sorted names
 
-## 3. Candidate Generation (Blocking)
+acronyms
 
-- **Blocking keys used:** Core name, sorted core name, first name word, exact address, street number, name MinHash LSH (3 bands, 5 per band), and Address MinHash LSH (for robust fuzzy address matching).
-- **Candidate priority queue:** In highly collision-prone buckets (e.g., matching on common words like "Corp" or "Inc"), we implemented a priority queue. Entities with fewer total blocking keys are prioritized in the bucket over entities with hundreds of blocking keys, ensuring unique, hard-to-find entities get shortlisting precedence.
-- **Source-balanced shortlisting:** The top `K` candidates per Source-1 entity were explicitly balanced to consider Source-2 and Source-3 equally, rather than letting one dominating source crowd out the other.
+exact and tokenized addresses
 
----
+postal codes and street numbers
 
-## 4. Matching Model
+rare name tokens
 
-**Features used:**
-- Name features: Jaccard, token overlap, hashed character trigram cosine similarity, length ratios, legal suffix agreement, and token count differences.
-- Address features: Address Jaccard, exact street number match, address token set ratios, and address token overlap.
-- Metadata & Missingness: Boolean indicators for missing names and addresses on both left and right sides, target_source indicator (S2 vs S3), and country conflict detection.
+phonetic/Soundex keys
 
-**Model type:** LightGBM Classifier (with bagging, feature fractions, and tuned minimum child samples to prevent overfitting).  
-**Threshold selection method:** We selected the threshold by running independent validations for country-OOD (proxy for France) and in-distribution sets, and taking the maximum (most conservative) threshold to protect the precision-heavy macro F0.5 score.
+character n-gram MinHash-LSH
 
----
+bounded retrieval from oversized frequency buckets
 
-## 5. Results & Error Analysis
+Keys above the configured frequency ceiling are discarded from the unrestricted join rather than truncated by entity-ID position. Oversized buckets are handled only through bounded relevance-aware rescue.
 
-- **F_0.5 Score (macro):** [Pending completion of prediction run]
-- **Common false positives (wrong merges):** Entities sharing identical names but missing critical distinguishing details (like country or address).
-- **Common false negatives (missed matches):** Drastic name alterations not caught by standard token features or LSH blocking.
+The final candidate set has a hard maximum but is not padded to that maximum. Weak candidates can be removed by the validated adaptive selection policy.
 
----
+candidate_pairs.tsv is generated from the same final candidate table that feeds feature computation and model inference.
 
-## 6. Conclusion
-By systematically auditing the pipeline from SQLite blocking up to LightGBM feature engineering, we addressed core systemic bottlenecks. Prioritizing rare entities during blocking retrieval significantly improved the candidate pool, and missingness features successfully steered the model to reject low-confidence, sparse-data pairs.
+Features
 
----
+The pair representation contains 65 features covering:
 
-## Appendix
+exact and fuzzy name/address similarity
 
-### A. Code Artefacts
-Our complete, runnable code ships in the submission zip under `code/business_entity_resolution/`. It is deterministic and reproducible.
-Entry points:
-- `python run.py --mode validate`: Generates the validation report.
-- `python run.py --mode predict`: Creates the final `matching_results.tsv` and `candidate_pairs.tsv` required for submission.
+token-set, token-sort and partial similarity
 
-### B. Additional Results
-The code includes an extensive suite of unit tests verifying all blocking edge cases, feature computations, and deterministic properties.
+character-trigram cosine similarity
+
+token overlap and containment
+
+postal-code and street-number agreement/conflict
+
+structured street/city comparisons
+
+legal-suffix consistency
+
+acronym relationships
+
+missingness
+
+country match/conflict
+
+retrieval evidence and candidate rank
+
+name-vs-address ranking agreement
+
+reciprocal candidate rank and mutual-best signal
+
+cross-source corroboration
+
+training-derived lexical-variation scores
+
+The training-derived variation model is fit only from positive training pairs inside the appropriate training fold, avoiding validation-label leakage.
+
+Models and tuning
+
+The first real validation run is intentionally an untuned baseline using the LightGBM pair classifier and fixed threshold 0.5. This establishes a reproducible evidence baseline before any weighting, ensemble or decision-policy choice is retained.
+
+The post-baseline tuning stage evaluates:
+
+unweighted LightGBM
+
+balanced LightGBM
+
+moderate scale_pos_weight
+
+a standardized logistic regression model
+
+probability ensemble variants
+
+training-derived lexical variation
+
+Thresholds are optimized against grouped macro F0.5 rather than ordinary pairwise accuracy.
+
+The selected production policy is evaluated across:
+
+in-distribution Source-1 splits
+
+country holdout
+
+reverse-country holdout
+
+and stores country-specific and unseen-country decision policies.
+
+Decisioning
+
+The final decision is made per Source-1 entity rather than independently for every pair.
+
+The policy supports:
+
+high-confidence acceptance
+
+lower-confidence rejection
+
+an ambiguity band
+
+a stricter requirement for additional matches
+
+a hard maximum number of matches
+
+minimum absolute score
+
+The decision layer operates only on candidates already present in candidate_pairs.tsv; it cannot introduce an out-of-candidate match.
+
+Validation and reproducibility
+
+Run the pipeline in this order:
+
+python run.py --mode validate
+python run.py --mode tune
+python run.py --mode predict --check-submission
+
+The baseline validation produces scratch/validation_report.json. The tuning stage produces scratch/tuned_policy.json and scratch/decision_policy.json. Prediction writes:
+
+output/matching_results.tsv
+output/candidate_pairs.tsv
+
+The official challenge validator is run with --check-ids before a submission package is considered ready.
+
+Fair play
+
+The implementation uses only the supplied challenge records and labels. It performs no external business lookup, registry search, geocoding, commercial API lookup, or web-based entity enrichment.

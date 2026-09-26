@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from .decision import optimize_grouped_threshold
+from .decision import optimize_grouped_threshold, choose_hysteresis_policy
 from .model import LinearPairModel, PairModel, ProbabilityEnsemble
 
 LOGGER = logging.getLogger(__name__)
@@ -288,6 +288,34 @@ def tune(
         selected_country = float(cross_results[selected_name]["country_holdout"]["threshold"])
         selected_reverse = float(cross_results[selected_name]["reverse_country_holdout"]["threshold"])
         selected_id = float(results[selected_name]["threshold"])
+
+        # The threshold itself is measured from grouped macro-F0.5.  The
+        # entity-level hysteresis parameters remain conservative defaults here;
+        # they are part of the policy contract and are fully wired into prediction.
+        # They can be tuned in a later measured experiment without changing the
+        # baseline gate.
+        country_policy = choose_hysteresis_policy(
+            selected_country,
+            ambiguous_margin=0.03,
+            second_match_delta=0.04,
+            max_matches=top_k,
+            min_absolute_score=0.0,
+        )
+        reverse_policy = choose_hysteresis_policy(
+            selected_reverse,
+            ambiguous_margin=0.03,
+            second_match_delta=0.04,
+            max_matches=top_k,
+            min_absolute_score=0.0,
+        )
+        id_policy = choose_hysteresis_policy(
+            selected_id,
+            ambiguous_margin=0.03,
+            second_match_delta=0.04,
+            max_matches=top_k,
+            min_absolute_score=0.0,
+        )
+
         policy = {
             "version": 3,
             "status": "tuned_after_real_baseline",
@@ -310,6 +338,11 @@ def tune(
             },
             "id_threshold": selected_id,
             "unseen_country_threshold": selected_reverse,
+            "decision_policies": {
+                train_country: reverse_policy.to_dict(),
+                validation_country: country_policy.to_dict(),
+            },
+            "unseen_decision_policy": reverse_policy.to_dict(),
             "selection_metric": "mean of ID, country-holdout and reverse-country macro-F0.5",
             "results": {
                 "models": results,
@@ -321,7 +354,23 @@ def tune(
             },
             "runtime_seconds": time.perf_counter() - t0,
         }
-        (scratch / "tuned_policy.json").write_text(json.dumps(policy, indent=2), encoding="utf-8")
+        (scratch / "tuned_policy.json").write_text(
+            json.dumps(policy, indent=2),
+            encoding="utf-8",
+        )
+        (scratch / "decision_policy.json").write_text(
+            json.dumps(
+                {
+                    "version": policy["version"],
+                    "status": "tuned",
+                    "default": id_policy.to_dict(),
+                    "country_policies": policy["decision_policies"],
+                    "unseen_country": policy["unseen_decision_policy"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         LOGGER.info("Selected %s; robust F0.5=%.6f", selected_name, selection_rows[0][0])
         return policy
     finally:

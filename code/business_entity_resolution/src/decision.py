@@ -12,6 +12,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .metrics import f05_from_counts
+
 
 @dataclass(frozen=True)
 class DecisionPolicy:
@@ -25,16 +27,18 @@ class DecisionPolicy:
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
-
-def f05_from_counts(tp: int, predicted: int, truth: int) -> float:
-    if truth == 0:
-        return 1.0 if predicted == 0 else 0.0
-    if predicted == 0 or tp == 0:
-        return 0.0
-    precision = tp / predicted
-    recall = tp / truth
-    denominator = 0.25 * precision + recall
-    return (1.25 * precision * recall) / denominator if denominator else 0.0
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "DecisionPolicy":
+        allowed = {
+            "high_threshold",
+            "low_threshold",
+            "ambiguous_margin",
+            "second_match_delta",
+            "max_matches",
+            "min_absolute_score",
+        }
+        payload = {key: value[key] for key in allowed if key in value}
+        return cls(**payload)
 
 
 def optimize_grouped_threshold(

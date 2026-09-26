@@ -1060,13 +1060,21 @@ class BlockingStore:
         self.connection.commit()
 
         self.diagnostics = diagnostics
-        LOGGER.info(
-            "Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity, CMS recall %.4f%%)",
-            100 * diagnostics.get("final", {}).get("recall", 0),
-            fin_stats["total_pairs"],
-            fin_stats["avg_candidates"],
-            100 * diagnostics.get("final", {}).get("complete_match_set_recall", 0),
-        )
+        if has_truth:
+            LOGGER.info(
+                "Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity, CMS recall %.4f%%)",
+                100 * diagnostics["final"]["recall"],
+                fin_stats["total_pairs"],
+                fin_stats["avg_candidates"],
+                100 * diagnostics["final"]["complete_match_set_recall"],
+            )
+        else:
+            LOGGER.info(
+                "Final candidate set built: %d pairs, avg %.2f/entity "
+                "(test set has no truth, so recall is not computed)",
+                fin_stats["total_pairs"],
+                fin_stats["avg_candidates"],
+            )
         return fin_stats["total_pairs"]
 
     # ─── Legacy method restored to prevent old tests from crashing ───

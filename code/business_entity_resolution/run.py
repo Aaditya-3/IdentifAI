@@ -7,8 +7,10 @@ from pathlib import Path
 
 try:  # Supports both ``python run.py`` from this directory and module execution.
     from .src.pipeline import DEFAULT_TOP_K, predict, validate
+    from .src.tuning import tune
 except ImportError:
     from src.pipeline import DEFAULT_TOP_K, predict, validate
+    from src.tuning import tune
 
 
 # Repository root:
@@ -72,7 +74,7 @@ def main() -> None:
 
     parser.add_argument(
         "--mode",
-        choices=("validate", "predict"),
+        choices=("validate", "tune", "predict"),
         required=True,
     )
 
@@ -137,6 +139,15 @@ def main() -> None:
         ),
     )
 
+    parser.add_argument(
+        "--allow-baseline-predict",
+        action="store_true",
+        help=(
+            "Debug-only override allowing predict before a tuned_policy.json exists. "
+            "Do not use this for the final submission."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.top_k < 1:
@@ -158,11 +169,13 @@ def main() -> None:
         description="training dataset",
     )
 
-    test_dir = _resolve_dir(
-        args.test_dir,
-        default=DEFAULT_TEST_DIR,
-        description="test dataset",
-    )
+    test_dir = None
+    if args.mode == "predict":
+        test_dir = _resolve_dir(
+            args.test_dir,
+            default=DEFAULT_TEST_DIR,
+            description="test dataset",
+        )
 
     output_dir = _resolve_dir(
         args.output_dir,
@@ -184,13 +197,14 @@ def main() -> None:
 
     logging.info("Repository root: %s", REPO_ROOT)
     logging.info("Training data:   %s", train_dir)
-    logging.info("Test data:       %s", test_dir)
+    if test_dir is not None:
+        logging.info("Test data:       %s", test_dir)
     logging.info("Output directory:%s", output_dir)
     logging.info("Scratch directory:%s", scratch_dir)
     logging.info("Top-K:            %d", args.top_k)
 
     # ---------------------------------------------------------
-    # Validate
+    # Validate baseline
     # ---------------------------------------------------------
 
     if args.mode == "validate":
@@ -200,11 +214,28 @@ def main() -> None:
             args.seed,
             str(scratch_dir),
         )
-
         print(
-            f"Validation macro F0.5: "
+            f"Validation baseline macro F0.5: "
             f"{score:.6f} "
             f"(threshold={threshold:.6f})"
+        )
+        return
+
+    # ---------------------------------------------------------
+    # Post-baseline tuning
+    # ---------------------------------------------------------
+
+    if args.mode == "tune":
+        policy = tune(
+            str(train_dir),
+            args.top_k,
+            args.seed,
+            str(scratch_dir),
+        )
+        print(
+            f"Tuning complete: selected={policy['selected_model']} "
+            f"robust_macro_f0_5="
+            f"{policy['results']['selection_table'][0]['robust_macro_f0_5']:.6f}"
         )
         return
 
@@ -230,6 +261,7 @@ def main() -> None:
         args.top_k,
         args.seed,
         str(scratch_dir),
+        allow_baseline=args.allow_baseline_predict,
     )
 
     print(
@@ -239,7 +271,7 @@ def main() -> None:
 
     if args.check_submission:
         import subprocess
-        validator = REPO_ROOT / "student_resource" / "utils" / "validate_submission.py"
+        validator = Path(__file__).resolve().parent / "utils" / "validate_submission.py"
         if not validator.exists():
             raise FileNotFoundError(f"Official submission validator not found: {validator}")
         command = [

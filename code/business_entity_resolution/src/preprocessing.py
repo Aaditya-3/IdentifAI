@@ -8,9 +8,13 @@ from typing import Iterable, Mapping
 
 _SPACE = re.compile(r"\s+")
 _PUNCT = re.compile(r"[^\w]+", flags=re.UNICODE)
-_NUMBER = re.compile(r"(?<!\w)\d+(?!\w)")
+_NUMBER = re.compile(r"(?<!\w)\d+[A-Za-z]?(?!\w)")
 _POSTAL = re.compile(r"(?<!\d)\d{5,6}(?!\d)")
 _ADDRESS_SEPARATOR = re.compile(r"[,;|]+")
+_LANDMARK_FILLERS = re.compile(
+    r"\b(?:near|opposite|opp|beside|behind|next\s+to|in\s+front\s+of|close\s+to)\b",
+    flags=re.IGNORECASE,
+)
 
 _LEGAL_SUFFIXES = {
     "corporation": "corp", "corp": "corp", "incorporated": "inc", "inc": "inc",
@@ -102,7 +106,7 @@ def core_name(text: object) -> str:
 
 
 def normalize_address(text: object) -> str:
-    value = _base(text)
+    value = _LANDMARK_FILLERS.sub(" ", _base(text))
     return _SPACE.sub(
         " ",
         re.sub(

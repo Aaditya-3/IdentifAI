@@ -21,6 +21,8 @@ import numpy as np
 
 from .blocking import BlockingStore
 from .features import FEATURE_NAMES, feature_batch
+from .decision import DecisionPolicy
+from .metrics import f05_from_counts
 from .model import LinearPairModel, PairModel, ProbabilityEnsemble
 from .variation import VariationModel
 from .output import (
@@ -32,7 +34,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = BlockingStore.TOP_K
 BASELINE_THRESHOLD = 0.5
-CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v10-relation-aware"
+CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v11-wired"
 
 
 @dataclass(frozen=True)
@@ -120,7 +122,7 @@ def _store_signature(data_dir: str | Path, split: str, top_k: int, with_truth: b
         },
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "code_signatures": _module_signature(
-            "blocking.py", "preprocessing.py", "features.py", "variation.py", "model.py", "pipeline.py"
+            "blocking.py", "preprocessing.py", "features.py", "variation.py", "model.py", "decision.py", "tuning.py", "pipeline.py"
         ),
     }
 
@@ -335,16 +337,13 @@ def _grouped_f05(
         truth_count = truth_counts.get(sid, 0)
         pred_count = pred_counts.get(sid, 0)
         tp = tp_counts.get(sid, 0)
-        if truth_count == 0:
-            score = 1.0 if pred_count == 0 else 0.0
-        elif pred_count == 0 or tp == 0:
-            score = 0.0
-        else:
-            precision = tp / pred_count
-            recall = tp / truth_count
-            denom = 0.25 * precision + recall
-            score = (1.25 * precision * recall) / denom if denom else 0.0
-        score = float(score)
+        score = float(
+            f05_from_counts(
+                tp=int(tp),
+                predicted=int(pred_count),
+                truth=int(truth_count),
+            )
+        )
         scores.append(score)
         country = countries.get(sid, "") or "<missing>"
         per_country.setdefault(country, []).append(score)
@@ -421,15 +420,22 @@ def _build_variation_model(
     return model
 
 
-def _validate_policy_path(scratch: Path) -> Path:
+def _validate_policy_path(scratch: Path, *, allow_baseline: bool) -> Path:
     report_path = scratch / "validation_report.json"
-    policy_path = scratch / "decision_policy.json"
-    if not report_path.exists() or not policy_path.exists():
+    baseline_policy_path = scratch / "decision_policy.json"
+    tuned_policy_path = scratch / "tuned_policy.json"
+    if not report_path.exists() or not baseline_policy_path.exists():
         raise RuntimeError(
             "Prediction is blocked until a completed real validation run exists. "
             "Run `python run.py --mode validate` first."
         )
-    return policy_path
+    if not allow_baseline and not tuned_policy_path.exists():
+        raise RuntimeError(
+            "Prediction requires the measured tuning stage. "
+            "Run `python run.py --mode tune` first, or explicitly pass the "
+            "baseline-prediction override for debugging only."
+        )
+    return tuned_policy_path if tuned_policy_path.exists() else baseline_policy_path
 
 
 def validate(
@@ -606,6 +612,8 @@ def predict(
     top_k: int = DEFAULT_TOP_K,
     seed: int = 42,
     scratch_dir: str | Path = "scratch",
+    *,
+    allow_baseline: bool = False,
 ) -> float:
     """Train on all training data and write both required submission files.
 
@@ -615,10 +623,8 @@ def predict(
     """
     scratch = Path(scratch_dir)
     scratch.mkdir(parents=True, exist_ok=True)
-    baseline_policy_path = _validate_policy_path(scratch)
-    baseline_policy = json.loads(baseline_policy_path.read_text(encoding="utf-8"))
-    tuned_policy_path = scratch / "tuned_policy.json"
-    policy = json.loads(tuned_policy_path.read_text(encoding="utf-8")) if tuned_policy_path.exists() else baseline_policy
+    policy_path = _validate_policy_path(scratch, allow_baseline=allow_baseline)
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
 
     default_threshold = float(
         policy.get("id_threshold", policy.get("default_threshold", BASELINE_THRESHOLD))
@@ -628,7 +634,28 @@ def predict(
         for country, value in (policy.get("thresholds") or policy.get("country_thresholds") or {}).items()
     }
     unseen_threshold = float(
-        policy.get("unseen_country_threshold", policy.get("zero_shot_fallback_threshold", default_threshold))
+        policy.get(
+            "unseen_country_threshold",
+            policy.get("zero_shot_fallback_threshold", default_threshold),
+        )
+    )
+
+    # Decision policies are country-specific when tuning has measured them.
+    decision_payload = policy.get("decision_policies") or {}
+    default_decision = DecisionPolicy(
+        high_threshold=default_threshold,
+        low_threshold=default_threshold,
+        max_matches=top_k,
+        min_absolute_score=0.0,
+    )
+    decision_policies: dict[str, DecisionPolicy] = {}
+    for country, payload in decision_payload.items():
+        if isinstance(payload, dict):
+            decision_policies[str(country).casefold()] = DecisionPolicy.from_dict(payload)
+    if not decision_policies:
+        decision_policies = {str(country).casefold(): default_decision for country in threshold_by_country}
+    unseen_decision = DecisionPolicy.from_dict(
+        policy.get("unseen_decision_policy", default_decision.to_dict())
     )
 
     train_store = _build_store(
@@ -674,6 +701,8 @@ def predict(
             threshold_by_country=threshold_by_country or None,
             unseen_country_threshold=unseen_threshold,
             variation_model=variation_model,
+            decision_policies_by_country=decision_policies or None,
+            unseen_decision_policy=unseen_decision,
         )
         validate_output_against_store(
             store=test_store,

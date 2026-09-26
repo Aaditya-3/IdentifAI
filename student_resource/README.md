@@ -1,53 +1,52 @@
 Business Entity Resolution Pipeline
 
-Production-oriented, offline entity-resolution pipeline for the ML Challenge 2026 Business Entity Resolution task.
+Production-style, offline entity-resolution pipeline for the Amazon/IdentifAI business-record challenge.
 
-The challenge scores macro F0.5 per Source-1 entity, with precision weighted more heavily than recall. Source-1 may have zero, one, or many matches, so singleton false positives are important.
+What it does
 
-Package contract
+The pipeline uses only the supplied challenge data:
 
-A completed submission package must contain:
+deterministic name/address normalization and structured address parsing
 
-output/
-├── matching_results.tsv
-└── candidate_pairs.tsv
+frequency-aware inverted-index blocking
 
-code/business_entity_resolution/
-├── src/
-├── README.md
-└── requirements.txt
+MinHash/character-n-gram LSH
 
-Documentation.md
+phonetic, postal, street-number and acronym blocking keys
 
-The two TSVs are generated only by a completed prediction run. Do not create stand-in or cached submission files by hand.
+bounded high-frequency rescue
 
-Dataset layout
+adaptive candidate selection with a hard maximum rather than fixed-K padding
 
-The repository root must contain the materialized challenge data:
+65 pair features, including structured-address, reciprocal-rank and cross-source signals
 
-student_resource/
-├── dataset/
-│   ├── train/
-│   │   ├── train_source1.tsv
-│   │   ├── train_source2.tsv
-│   │   ├── train_source3.tsv
-│   │   └── train_ground_truth.tsv
-│   └── test/
-│       ├── test_source1.tsv
-│       ├── test_source2.tsv
-│       └── test_source3.tsv
-└── utils/
-    └── validate_submission.py
+training-derived lexical variation features, learned only from the training fold
 
-The pipeline explicitly rejects Git-LFS pointer stubs instead of processing them as data.
+LightGBM plus an optional standardized logistic model ensemble
+
+exact grouped macro-F0.5 threshold optimization
+
+country-aware/unseen-country decision policies
+
+streaming inference and strict submission-contract validation
+
+No external business registries, APIs, geocoders, or internet entity lookups are used.
 
 Environment
 
-Use Python 3.10+.
+Python 3.10+ is recommended.
 
-pip install -r code/business_entity_resolution/requirements.txt
+From the repository root:
 
-No virtual environment is included in the submission archive.
+python -m pip install -r code/business_entity_resolution/requirements.txt
+
+Windows activation example:
+
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r code\business_entity_resolution\requirements.txt
+
+The final submission package must not include .venv/.
 
 Test suite
 
@@ -55,125 +54,113 @@ Run from the repository root:
 
 python -m pytest -q
 
-The tests configure their own package path, so the command is reproducible from the clean repository root.
+The tests are written so the package can be validated from the repository root.
 
-Required first real-data run
+Required real-data workflow
 
-Do not tune thresholds, class weighting, ensemble rules, or pseudo-labeling before the first complete real-data validation report exists.
+The challenge requires a real validation run before model/threshold tuning is retained.
 
-Run:
+1. Baseline validation
+
+This does not perform model-weight or threshold search. It creates the measured baseline:
 
 python run.py --mode validate
 
-This creates:
+or explicitly:
 
-scratch/train.sqlite
+python run.py --mode validate   --data_dir student_resource/dataset/train   --scratch_dir scratch
+
+Expected artifact:
+
 scratch/validation_report.json
 scratch/decision_policy.json
 
-The first run is an untuned baseline: unweighted LightGBM with a fixed 0.5 threshold. The report records:
+2. Measured tuning
 
-country holdout F0.5 / precision / recall
+Only run this after the baseline report is complete:
 
-reverse-country holdout F0.5 / precision / recall
+python run.py --mode tune
 
-in-distribution F0.5 / precision / recall
+This evaluates the class-weighting/linear-ensemble/variation alternatives on the real held-out training data and writes:
 
-raw / final candidate recall
+scratch/tuned_policy.json
+scratch/decision_policy.json
 
-complete-match-set recall
+The selected policy is the one with the strongest robust measured macro-F0.5 across the in-distribution, country-holdout and reverse-country views used by the pipeline.
 
-candidate counts and per-country blocking diagnostics
+3. Final prediction
 
-stage runtime
-
-feature count and model configuration
-
-Use that real report as the evidence baseline for subsequent tuning.
-
-Full prediction run
-
-After a completed validation run:
+Prediction requires the tuned policy by default:
 
 python run.py --mode predict
 
-The command reuses the validated training candidate store when its input/code signatures still match, trains the production model on all training data, builds the test candidate store, streams inference, and writes:
+This produces:
 
 output/matching_results.tsv
 output/candidate_pairs.tsv
 
-The writer enforces the required candidate-subset relationship and checks that every test Source-1 entity receives exactly one row, including empty rows for no-match cases.
+For debugging only, a baseline prediction can be forced with:
 
-Official submission validation
+python run.py --mode predict --allow-baseline-predict
 
-Before packaging, run the official validator exactly as supplied by the challenge:
+Do not use the baseline override for the final submission.
 
-python student_resource/utils/validate_submission.py \
-  --matching output/matching_results.tsv \
-  --candidate output/candidate_pairs.tsv \
-  --test-dir student_resource/dataset/test \
-  --check-ids
+4. Official submission validation
 
-The --check-ids mode loads Source-2/3 IDs and can require substantial memory on the full test set. It is still the required final diagnostic before packaging.
-
-You can also ask the pipeline to run the same validator after prediction:
+Run:
 
 python run.py --mode predict --check-submission
 
-Candidate generation
+This invokes the supplied stdlib validator with --check-ids.
 
-Candidate generation uses:
+The final package must contain:
 
-normalized name, legal-suffix-stripped core name and sorted core
+output/
+  matching_results.tsv
+  candidate_pairs.tsv
 
-acronyms and rare tokens
+code/
+  business_entity_resolution/
+    src/
+    README.md
+    requirements.txt
 
-extracted address numbers and postal codes
+Documentation.md
 
-phonetic token keys
+Output contract
 
-character-ngram MinHash-LSH on names and addresses
+matching_results.tsv:
 
-frequency-aware key filtering rather than arbitrary ID-order truncation
+source1_entity_id    matched_entity_ids
 
-bounded rescue retrieval for oversized blocks
+candidate_pairs.tsv:
 
-recall-first shortlist construction
+source1_entity_id    candidate_entity_ids
 
-adaptive final candidate counts with a hard maximum rather than fixed padding
+Both are tab-separated. The ID lists are comma-separated.
 
-candidate_pairs.tsv is generated from the final candidate table that is actually passed into the matching model. It is not an earlier raw blocking dump.
+The pipeline guarantees:
 
-Features
+exactly one row for every Source-1 test entity
 
-The feature layer combines:
+empty lists for entities with no selected matches/candidates
 
-exact and fuzzy name/address similarities
+candidate IDs are S2/S3 only
 
-token-set and token-sort similarities
+no duplicate IDs inside an ID list
 
-legal suffix agreement/conflict
+every final match is contained in the exact candidate set passed to the model
 
-acronym agreement
+The official validator remains the final submission gate.
 
-number and postal-code consistency
+Design notes
 
-conservative structured address components (street number, street, city when explicitly delimited, postal code)
+The candidate set is the final set stored in final_candidates; that exact set is both written to candidate_pairs.tsv and passed to the downstream feature/model stage.
 
-country agreement/conflict/missingness
+The hard candidate maximum is a ceiling, not a target. The adaptive selector can retain substantially fewer candidates for easy entities.
 
-character-trigram similarity
+The validation/tuning pipeline is intentionally separated so a threshold or weighting choice is not silently introduced before a real baseline exists.
 
-candidate rank and blocking evidence
+Fair-play constraints
 
-cross-field name/address rank agreement
-
-reciprocal candidate rank and a mutual-best indicator
-
-missingness indicators
-
-No external business registry, geocoder, API, web lookup or other data augmentation is used.
-
-Reproducibility
-
-SQLite candidate stores include signatures for input files, blocking configuration, feature/preprocessing/model code and the cache schema. A stale candidate database is rebuilt automatically instead of being silently reused.
+The implementation does not perform external entity lookup or data enrichment. All learned variation maps, models and decision policies are derived from the supplied training data and held-out validation design.
