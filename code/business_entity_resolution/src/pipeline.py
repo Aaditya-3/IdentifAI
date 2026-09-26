@@ -111,65 +111,84 @@ def _fast_tune_threshold(
     where: str,
     parameters: Sequence[object],
 ) -> tuple[float, float]:
-    """Evaluate 150+ thresholds in under 0.3 seconds in Python memory."""
-    s1_rows = store.connection.execute(f"SELECT entity_id FROM source1 s WHERE {where}", parameters).fetchall()
-    all_s1_set = {r[0] for r in s1_rows}
+    """Exact O(N log N) threshold optimization over all observed probabilities."""
+    s1_rows = store.connection.execute(f"SELECT entity_id FROM source1 s WHERE {where} ORDER BY entity_id", parameters).fetchall()
+    all_s1_list = [r[0] for r in s1_rows]
+    total_entities = len(all_s1_list)
+    s1_to_idx = {sid: i for i, sid in enumerate(all_s1_list)}
 
+    tc_arr = np.zeros(total_entities, dtype=np.int32)
     truth_rows = store.connection.execute(
         f"SELECT t.source1_id, COUNT(*) FROM truth t JOIN source1 s ON s.entity_id=t.source1_id WHERE {where} GROUP BY t.source1_id",
         parameters
     ).fetchall()
-    true_counts = {r[0]: int(r[1]) for r in truth_rows}
+    for sid, count in truth_rows:
+        if sid in s1_to_idx:
+            tc_arr[s1_to_idx[sid]] = count
 
-    s1_ids = []
+    s1_indices = []
     with matrix.pairs_path.open("r", encoding="utf-8") as f:
         for line in f:
-            s1_ids.append(line.split("\t", 1)[0])
-    s1_ids_arr = np.asarray(s1_ids)
+            s1_indices.append(s1_to_idx[line.split("\t", 1)[0]])
+    s1_indices_arr = np.asarray(s1_indices, dtype=np.int32)
 
     labels = matrix.y()
-    is_true_arr = np.asarray(labels, dtype=bool) if labels is not None else np.zeros(len(s1_ids_arr), dtype=bool)
+    is_true_arr = np.asarray(labels, dtype=bool) if labels is not None else np.zeros(len(s1_indices_arr), dtype=bool)
 
-    thresholds = np.unique(np.concatenate((
-        np.round(np.arange(0.30, 0.901, 0.02), 3),
-        np.round(np.arange(0.901, 0.996, 0.005), 3),
-    )))
+    sort_idx = np.argsort(-probabilities)
+    probs_sorted = probabilities[sort_idx]
+    s1_sorted = s1_indices_arr[sort_idx]
+    is_true_sorted = is_true_arr[sort_idx]
 
-    best_score, best_thresh = -1.0, 0.95
-    total_entities = len(all_s1_set)
+    pc_arr = np.zeros(total_entities, dtype=np.int32)
+    tp_arr = np.zeros(total_entities, dtype=np.int32)
+    
+    # Initialize f05_arr
+    # If tc_arr[i] == 0, initially pc == 0, so f05 is 1.0. If tc_arr > 0, initially f05 is 0.0.
+    f05_arr = np.where(tc_arr == 0, 1.0, 0.0)
+    total_f05 = np.sum(f05_arr)
 
-    for thresh in thresholds:
-        mask = probabilities >= thresh
-        pred_s1 = s1_ids_arr[mask]
-        pred_true = is_true_arr[mask]
+    best_score = float(total_f05 / total_entities) if total_entities > 0 else 0.0
+    best_thresh = 1.0
 
-        p_counts = defaultdict(int)
-        tp_counts = defaultdict(int)
-
-        for sid, is_t in zip(pred_s1, pred_true):
-            p_counts[sid] += 1
-            if is_t:
-                tp_counts[sid] += 1
-
-        total_f05 = 0.0
-        for sid in all_s1_set:
-            tc = true_counts.get(sid, 0)
-            pc = p_counts.get(sid, 0)
-            tp = tp_counts.get(sid, 0)
-
+    n_preds = len(probs_sorted)
+    i = 0
+    while i < n_preds:
+        thresh = probs_sorted[i]
+        
+        while i < n_preds and probs_sorted[i] == thresh:
+            s1 = s1_sorted[i]
+            is_tp = is_true_sorted[i]
+            
+            total_f05 -= f05_arr[s1]
+            
+            pc_arr[s1] += 1
+            if is_tp:
+                tp_arr[s1] += 1
+                
+            tc = tc_arr[s1]
+            pc = pc_arr[s1]
+            tp = tp_arr[s1]
+            
             if tc == 0:
-                total_f05 += 1.0 if pc == 0 else 0.0
+                new_f05 = 1.0 if pc == 0 else 0.0
             elif pc == 0 or tp == 0:
-                total_f05 += 0.0
+                new_f05 = 0.0
             else:
                 p = tp / pc
                 r = tp / tc
                 denom = 0.25 * p + r
-                total_f05 += (1.25 * p * r) / denom if denom > 0 else 0.0
-
-        score = total_f05 / total_entities
-        if score > best_score or (score == best_score and thresh > best_thresh):
-            best_score, best_thresh = score, float(thresh)
+                new_f05 = (1.25 * p * r) / denom if denom > 0 else 0.0
+                
+            f05_arr[s1] = new_f05
+            total_f05 += new_f05
+            
+            i += 1
+            
+        score = float(total_f05 / total_entities)
+        if score > best_score or (score == best_score and float(thresh) > best_thresh):
+            best_score = score
+            best_thresh = float(thresh)
 
     return best_score, best_thresh
 

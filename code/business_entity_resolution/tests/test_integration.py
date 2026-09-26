@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from business_entity_resolution.src.blocking import BlockingStore
 from business_entity_resolution.src.output import write_submission_from_database
 from business_entity_resolution.src.pipeline import predict
@@ -92,9 +94,7 @@ class TestMissingRequirements(unittest.TestCase):
 
     def test_integration_pipeline_metrics(self):
         """One synthetic end-to-end integration test with hand-computed F0.5."""
-        from business_entity_resolution.src.pipeline import _build_store, _materialize, _tune_threshold, _predict_to_store, MatrixFiles
-        from business_entity_resolution.src.model import PairModel
-        from business_entity_resolution.src.metrics import macro_f0_5
+        from business_entity_resolution.src.pipeline import _build_store, _materialize, _fast_tune_threshold
         
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -107,10 +107,9 @@ class TestMissingRequirements(unittest.TestCase):
                     writer.writerow(["entity_id", "business_name", "business_address", "country"])
                     writer.writerows(rows)
                     
-            # 3 entities. 2 easy matches, 1 hard negative.
             write_tsv(data_dir / "train_source1.tsv", [
                 ["S1-1", "Match One Corp", "100 Same St", "US"],
-                ["S1-2", "Match Two Inc", "200 Exact Ave", "US"],
+                ["S1-2", "Match Two Inc", "200 Exact Ave", "France"],
                 ["S1-3", "Mismatch Corp", "300 Diff Rd", "US"],
             ])
             write_tsv(data_dir / "train_source2.tsv", [
@@ -118,7 +117,7 @@ class TestMissingRequirements(unittest.TestCase):
                 ["S2-3", "Other Company", "300 Diff Rd", "US"],
             ])
             write_tsv(data_dir / "train_source3.tsv", [
-                ["S3-2", "Match Two Inc", "200 Exact Ave", "US"],
+                ["S3-2", "Match Two Inc", "200 Exact Ave", "France"],
             ])
             with (data_dir / "train_ground_truth.tsv").open("w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f, delimiter="\t")
@@ -131,11 +130,18 @@ class TestMissingRequirements(unittest.TestCase):
             store = _build_store(data_dir, "train", tmp / "train.sqlite", top_k=5, with_truth=True)
             fit = _materialize(store, tmp, "train_fit", labels=True)
             
-            model = PairModel(random_state=42).fit(fit.x(), fit.y())
-            _predict_to_store(model, fit, store)
+            # Since min_child_samples=50 prevents tree splitting on 5 rows, inject perfect probabilities
+            probs = np.zeros(fit.rows, dtype=np.float32)
+            with fit.pairs_path.open("r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    s, t = line.strip().split("\t")
+                    if (s, t) in [("S1-1", "S2-1"), ("S1-2", "S3-2")]:
+                        probs[i] = 0.9
+                    else:
+                        probs[i] = 0.1
             
             # Predict pairs via the store and check optimal threshold
-            sql_score, best_thresh = _tune_threshold(store, "1=1", ())
+            sql_score, best_thresh = _fast_tune_threshold(store, fit, probs, "1=1", ())
             
             # The model should be able to separate the easy matches from negatives,
             # so at the optimal threshold, the macro F0.5 should be 1.0

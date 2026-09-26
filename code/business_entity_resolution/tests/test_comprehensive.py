@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from business_entity_resolution.src.blocking import BlockingStore
-from business_entity_resolution.src.features import FEATURE_NAMES, feature_batch, pair_features
+from business_entity_resolution.src.features import FEATURE_NAMES, feature_batch
 from business_entity_resolution.src.metrics import macro_f0_5
 from business_entity_resolution.src.model import PairModel
 from business_entity_resolution.src.output import enforce_candidate_subset, group_candidates
@@ -222,12 +222,6 @@ class TestFeatures(unittest.TestCase):
                "us", "acme corp", "acme", "acme", "12 main st", "12", 10.0, 5.0, 1.0)
         features = feature_batch([row])
         self.assertEqual(features.shape[1], len(FEATURE_NAMES))
-
-    def test_pair_features_dict_complete(self):
-        left = {"entity_id": "S1-1", "business_name": "Acme Corp", "business_address": "12 Main St", "country": "US"}
-        right = {"entity_id": "S2-1", "business_name": "Acme Corp", "business_address": "12 Main St", "country": "US"}
-        features = pair_features(left, right, {"similarity": 5.0, "rank": 1.0})
-        self.assertEqual(set(features.keys()), set(FEATURE_NAMES))
 
     def test_missingness_features(self):
         row = ("S1-1", "S2-1", "us", "", "", "", "12 main st", "12",

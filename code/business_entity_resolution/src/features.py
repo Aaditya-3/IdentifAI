@@ -18,29 +18,30 @@ from .preprocessing import (
 )
 
 FEATURE_NAMES = [
-    # Exact matches
+    # Exact (4)
     "name_exact", "core_exact", "sorted_core_exact", "address_exact",
-    # Country signals
+    # Country (4)
     "country_match", "country_missing", "country_both_missing", "country_conflict",
-    # RapidFuzz edit & token ratios
+    # RapidFuzz (7)
     "name_ratio", "core_ratio", "address_ratio",
     "name_token_sort_ratio", "name_token_set_ratio", "address_token_sort_ratio", "address_token_set_ratio",
+    # Partial (2)
     "name_partial_ratio", "core_partial_ratio",
-    # Containment & Acronym
+    # Containment & Acronym (3)
     "name_token_containment", "address_token_containment", "acronym_match",
-    # Postal / Numbers
+    # Numbers & Postals (4)
     "address_number_jaccard", "first_number_match", "postal_match", "postal_conflict",
-    # Hashed 3-gram cosine
+    # Trigrams (2)
     "name_char_trigram_cosine", "address_char_trigram_cosine",
-    # Token overlap & Jaccard
+    # Token scores (4)
     "name_token_jaccard", "name_token_overlap", "address_token_jaccard", "address_token_overlap",
-    # Length & token counts
+    # Length & Counts (4)
     "name_length_ratio", "address_length_ratio", "name_token_count_diff", "core_token_count_diff",
-    # Retrieval prior signals
+    # Retrieval (3)
     "candidate_rank", "blocking_similarity", "target_source",
-    # Legal suffix consistency
+    # Suffix (2)
     "legal_suffix_agree", "legal_suffix_conflict",
-    # Missingness
+    # Missingness (4)
     "name_missing_left", "name_missing_right", "address_missing_left", "address_missing_right",
 ]
 
@@ -127,7 +128,6 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
     evidence, similarity, rank = columns[14:17]
 
-    # RapidFuzz scorers
     name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
     core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
     address_ratio = process.cpdist(s_address, t_address, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
@@ -152,8 +152,8 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     s_addr_len = np.asarray([len(v) for v in s_address], dtype=np.float32)
     t_addr_len = np.asarray([len(v) for v in t_address], dtype=np.float32)
 
-    s_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, "", 1).strip() for n, c in zip(s_name, s_core)]
-    t_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, "", 1).strip() for n, c in zip(t_name, t_core)]
+    s_suffix = [n[len(c):].strip() if c and n.startswith(c) else (n.replace(c, "", 1).strip() if c else "") for n, c in zip(s_name, s_core)]
+    t_suffix = [n[len(c):].strip() if c and n.startswith(c) else (n.replace(c, "", 1).strip() if c else "") for n, c in zip(t_name, t_core)]
 
     return np.column_stack((
         # Exact
@@ -196,14 +196,3 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
         np.asarray([not a for a in s_address], dtype=np.float32),
         np.asarray([not a for a in t_address], dtype=np.float32),
     )).astype(np.float32, copy=False)
-
-
-def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -> dict[str, float]:
-    s_name, t_name = normalize_name(left.get("business_name", "")), normalize_name(right.get("business_name", ""))
-    s_core, t_core = core_name(left.get("business_name", "")), core_name(right.get("business_name", ""))
-    s_address, t_address = normalize_address(left.get("business_address", "")), normalize_address(right.get("business_address", ""))
-    s_sorted, t_sorted = " ".join(sorted(s_core.split())), " ".join(sorted(t_core.split()))
-    row = ("", "", str(left.get("country", "")).casefold(), s_name, s_core, s_sorted, s_address, extract_address_numbers(s_address),
-           str(right.get("country", "")).casefold(), t_name, t_core, t_sorted, t_address, extract_address_numbers(t_address),
-           0.0, float(retrieval.get("similarity", 0.0)), float(retrieval.get("rank", 0.0)))
-    return dict(zip(FEATURE_NAMES, feature_batch([row])[0].tolist()))

@@ -107,33 +107,9 @@ def write_submission_stream(
         for row in reader:
             if sid := (row.get("entity_id") or "").strip():
                 s1_order.append(sid)
-
-    results_cand = {}
-    results_match = {}
     
-    with pairs_path.open("r", encoding="utf-8") as f:
-        current_sid = None
-        c_list = []
-        m_list = []
-        for idx, line in enumerate(f):
-            sid, tid = line.rstrip("\n").split("\t", 1)
-            if sid != current_sid:
-                if current_sid is not None:
-                    results_cand[current_sid] = ",".join(c_list)
-                    if m_list:
-                        results_match[current_sid] = ",".join(m_list)
-                current_sid = sid
-                c_list = [tid]
-                m_list = [tid] if probabilities[idx] >= threshold else []
-            else:
-                c_list.append(tid)
-                if probabilities[idx] >= threshold:
-                    m_list.append(tid)
-                    
-        if current_sid is not None:
-            results_cand[current_sid] = ",".join(c_list)
-            if m_list:
-                results_match[current_sid] = ",".join(m_list)
+    # Sort to match the SQLite ORDER BY source1_id used when creating pairs_path
+    s1_order.sort()
 
     with candidate_path.open("w", encoding="utf-8", newline="") as fc, \
          matching_path.open("w", encoding="utf-8", newline="") as fm:
@@ -141,9 +117,35 @@ def write_submission_stream(
         fc.write("source1_entity_id\tcandidate_entity_ids\n")
         fm.write("source1_entity_id\tmatched_entity_ids\n")
         
+        pairs_iter = pairs_path.open("r", encoding="utf-8")
+        current_pair_line = pairs_iter.readline()
+        prob_idx = 0
+        
         for sid in s1_order:
-            fc.write(f"{sid}\t{results_cand.get(sid, '')}\n")
-            fm.write(f"{sid}\t{results_match.get(sid, '')}\n")
+            c_list = []
+            m_list = []
+            
+            while current_pair_line:
+                pair_sid, pair_tid = current_pair_line.rstrip("\n").split("\t", 1)
+                if pair_sid < sid:
+                    # Should not happen if everything is consistent, but skip if it does
+                    current_pair_line = pairs_iter.readline()
+                    prob_idx += 1
+                    continue
+                elif pair_sid == sid:
+                    c_list.append(pair_tid)
+                    if probabilities[prob_idx] >= threshold:
+                        m_list.append(pair_tid)
+                    current_pair_line = pairs_iter.readline()
+                    prob_idx += 1
+                else:
+                    # pair_sid > sid, which means no more targets for this sid
+                    break
+                    
+            fc.write(f"{sid}\t{','.join(c_list)}\n")
+            fm.write(f"{sid}\t{','.join(m_list)}\n")
+            
+        pairs_iter.close()
 
     LOGGER.info("Streamed %d Source 1 records directly to %s and %s", len(s1_order), candidate_path.name, matching_path.name)
     return candidate_path, matching_path

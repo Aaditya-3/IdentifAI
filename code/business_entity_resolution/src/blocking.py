@@ -32,9 +32,9 @@ class BlockingStore:
     MINHASH_BANDS = 16  # r=2 rows/band -> 99.0% recall on 0.5 Jaccard overlap
     TOKEN_DF_LIMIT = 5_000
     
-    _MINHASH_PRIME = np.uint64(2_305_843_009_213_693_951)
-    _MINHASH_A = np.asarray([175024136490432477, 1008461672852386719, 304050906325147733, 219375881232363861, 1192609536327377963, 134449713686080091, 715803879697798251, 2055673613667237879, 2238042901163330401, 987556459621084289, 1614146762471928973, 571695673060610799, 1121592436292092571, 1716141154001985503, 452456183571917821, 2019785756305873093, 1545412558405659237, 1080267597293584387, 772952590234537641, 1774101489297710499, 637527053171929559, 1400412172066132301, 386650502565740121, 1876880236773344987, 941958701131499973, 1224242964453961681, 203213846197551769, 1049488408464727727, 229688990350128819, 1460129560061248699, 509318116929722547, 1973024535596978649], dtype=np.uint64)
-    _MINHASH_B = np.asarray([90119446130723957, 592104492043502371, 1509280258895496711, 467556482198014509, 183728047809268817, 1270849163460746191, 394407868526144257, 1754983723644681889, 804355541601597777, 210411929209609711, 1022914920567892697, 1377703091700300033, 275388934354195033, 1966363016444041723, 830275129151219099, 1097683924686424117, 548557095446627023, 1582685027813246659, 658466264737671963, 126214514629763221, 1700410973577759927, 309525570113233513, 1169352436691760691, 451937827317298453, 1916317775890083869, 730380426196709007, 1352908105434264199, 258348877255819047, 214103520682410357, 940778968761157123, 1666261754332139261, 698453635253312941], dtype=np.uint64)
+    _MINHASH_PRIME = np.uint64(4294967291)
+    _MINHASH_A = np.asarray([2746317214, 478163328, 107420370, 3184935164, 1181241944, 1051802513, 958682847, 599310826, 3163119786, 440213416, 2906402158, 3181143732, 3831882065, 2342331445, 373399427, 2536146026, 1812140442, 136505588, 127978095, 402418011, 939042956, 999270937, 2170484434, 2585650757, 113971124, 2410529191, 854001194, 3075280818, 2791232394, 3012167821, 2340505847, 1801823909], dtype=np.uint64)
+    _MINHASH_B = np.asarray([946785248, 1929338154, 2530876844, 1194819984, 3476477323, 3733616459, 27911967, 3259052811, 3460967357, 685731524, 2998485882, 1815115025, 1461364854, 1193448329, 667779376, 924765563, 4111198819, 3279182318, 1445662585, 438989805, 398340369, 1631775357, 415393687, 1541804686, 3639960595, 1477278577, 2592983555, 1136108454, 3466589567, 186618211, 3134174160, 1973214822], dtype=np.uint64)
 
     def __init__(self, database: str | Path, top_k: int = TOP_K, key_cap: int = KEY_CAP):
         self.path = Path(database)
@@ -46,7 +46,7 @@ class BlockingStore:
         self.connection.execute("PRAGMA temp_store=FILE")
         self.connection.execute("PRAGMA cache_size=-200000")
         self._rare_token_cache: dict[str, bool] = {}
-        self._rare_token_set: set[str] | None = None
+        self._common_token_set: set[str] | None = None
         self.diagnostics: dict = {}
 
     def close(self) -> None:
@@ -162,8 +162,8 @@ class BlockingStore:
         for token in set(core.split()):
             if len(token) < 3:
                 continue
-            if self._rare_token_set is not None:
-                if token in self._rare_token_set:
+            if self._common_token_set is not None:
+                if token not in self._common_token_set:
                     yield token
                 continue
             rare = self._rare_token_cache.get(token)
@@ -195,9 +195,9 @@ class BlockingStore:
             )
         self.connection.commit()
 
-        self._rare_token_set = {
+        self._common_token_set = {
             row[0] for row in self.connection.execute(
-                "SELECT token FROM token_df WHERE frequency <= ?", (self.TOKEN_DF_LIMIT,)
+                "SELECT token FROM token_df WHERE frequency > ?", (self.TOKEN_DF_LIMIT,)
             )
         }
         self._rare_token_cache.clear()
@@ -354,9 +354,6 @@ class BlockingStore:
             addr_scores = process.cpdist(s_addrs, t_addrs, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
 
             for (sid, tid, *_, ev), n_s, a_s in zip(rows, name_scores, addr_scores):
-                # EVALUATOR FIX: The Candidate Floor to prevent 30-candidate padding on singletons
-                if n_s < 20.0 and a_s < 20.0:
-                    continue
                 sim = float(ev) + (float(n_s) / 20.0) + (float(a_s) / 100.0)
                 scored_batch.append((sid, tid, float(ev), sim))
 
