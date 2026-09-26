@@ -9,6 +9,7 @@ from scipy import sparse as sp
 from sklearn.feature_extraction.text import HashingVectorizer
 
 from .preprocessing import extract_acronym, extract_address_numbers, extract_postal_code, normalize_address, normalize_name
+from .semantic_retrieval import SemanticRetriever, entity_text
 from .variation import VariationModel
 
 FEATURE_NAMES = [
@@ -53,6 +54,9 @@ FEATURE_NAMES = [
     # Training-derived lexical variation (zero-valued during untuned baseline).
     "learned_name_alias", "learned_name_explained",
     "learned_address_alias", "learned_address_explained",
+    # Semantic retrieval / reranking.
+    "semantic_similarity", "semantic_rank_score",
+    "semantic_lexical_alignment", "cross_encoder_score",
 ]
 
 _CHAR_TRIGRAMS = HashingVectorizer(
@@ -209,7 +213,31 @@ def _group_relational_scores(
 
 
 def _safe_optional_columns(columns: list[tuple], n: int) -> tuple[list[str], ...]:
-    """Read advanced columns while preserving compatibility with old test rows."""
+    """Read structured/rank columns while preserving legacy test compatibility."""
+    # Current candidate rows have 19 base columns followed by 13 structured/rank
+    # fields. Older tests may still pass the historical 30/31-column shape.
+    if len(columns) >= 32:
+        s_num = columns[19]
+        s_street = columns[20]
+        s_city = columns[21]
+        s_postal = columns[22]
+        t_num = columns[23]
+        t_street = columns[24]
+        t_city = columns[25]
+        t_postal = columns[26]
+        name_rank = columns[27]
+        address_rank = columns[28]
+        reverse_rank = columns[29]
+        mutual_best = columns[30]
+        rank_agreement = columns[31]
+        return (
+            list(s_num), list(s_street), list(s_city), list(s_postal),
+            list(t_num), list(t_street), list(t_city), list(t_postal),
+            list(name_rank), list(address_rank), list(reverse_rank),
+            list(mutual_best), list(rank_agreement),
+        )
+
+    # Legacy rich rows without semantic columns.
     if len(columns) >= 30:
         s_num = columns[17]
         s_street = columns[18]
@@ -243,7 +271,11 @@ def _safe_optional_columns(columns: list[tuple], n: int) -> tuple[list[str], ...
     )
 
 
-def feature_batch(rows: Sequence[tuple], variation_model: VariationModel | None = None) -> np.ndarray:
+def feature_batch(
+    rows: Sequence[tuple],
+    variation_model: VariationModel | None = None,
+    semantic_retriever: SemanticRetriever | None = None,
+) -> np.ndarray:
     """Vectorize a batch of candidate rows.
 
     ``rows`` may be the legacy 17-column candidate representation used by older
@@ -256,6 +288,14 @@ def feature_batch(rows: Sequence[tuple], variation_model: VariationModel | None 
     s_country, s_name, s_core, s_sorted, s_address, s_numbers = columns[2:8]
     t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
     evidence, similarity, rank = columns[14:17]
+    semantic_similarity = (
+        np.asarray(columns[17], dtype=np.float32)
+        if len(columns) >= 19 else np.zeros(len(rows), dtype=np.float32)
+    )
+    semantic_rank = (
+        np.asarray(columns[18], dtype=np.float32)
+        if len(columns) >= 19 else np.zeros(len(rows), dtype=np.float32)
+    )
     (
         s_num, s_street, s_city, s_postal,
         t_num, t_street, t_city, t_postal,
@@ -311,6 +351,30 @@ def feature_batch(rows: Sequence[tuple], variation_model: VariationModel | None 
         learned_variation = variation_model.score_batch(
             s_core, t_core, s_address, t_address
         )
+
+    semantic_rank_score = np.divide(
+        1.0,
+        1.0 + semantic_rank,
+        out=np.zeros(len(rows), dtype=np.float32),
+        where=semantic_rank > 0,
+    )
+    semantic_lexical_alignment = semantic_similarity * np.maximum(name_ratio, address_ratio)
+
+    if semantic_retriever is None or not np.any(semantic_rank > 0):
+        cross_encoder_score = np.zeros(len(rows), dtype=np.float32)
+    else:
+        rerank_rows = []
+        for sc, sa, scountry, tc, ta, tcountry, srank in zip(
+            s_name, s_address, s_country, t_name, t_address, t_country, semantic_rank
+        ):
+            rerank_rows.append(
+                (
+                    entity_text(str(sc), str(sa), str(scountry)),
+                    entity_text(str(tc), str(ta), str(tcountry)),
+                    int(srank),
+                )
+            )
+        cross_encoder_score = semantic_retriever.rerank(rerank_rows)
 
     return np.column_stack((
         # Exact
@@ -368,4 +432,7 @@ def feature_batch(rows: Sequence[tuple], variation_model: VariationModel | None 
         bridge_gap,
         learned_variation[:, 0], learned_variation[:, 1],
         learned_variation[:, 2], learned_variation[:, 3],
+        # Semantic retrieval / reranking
+        semantic_similarity, semantic_rank_score,
+        semantic_lexical_alignment, cross_encoder_score,
     )).astype(np.float32, copy=False)

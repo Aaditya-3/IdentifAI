@@ -189,6 +189,8 @@ def apply_entity_policy(
             or bridge >= 0.80
             or alias >= 0.80
             or address_alias >= 0.80
+            or float(row.get("cross_encoder_score", 0.0)) >= 0.85
+            or float(row.get("semantic_score", 0.0)) >= 0.90
         )
 
         if probability < policy.high_threshold:

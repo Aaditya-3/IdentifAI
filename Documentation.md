@@ -1,142 +1,47 @@
-Business Entity Resolution Challenge — Methodology
+Business Entity Resolution Pipeline — Methodology
 
 Objective
 
-The pipeline resolves each Source-1 record to zero, one, or many Source-2/Source-3 records using only the supplied challenge data. The competition metric is macro F0.5 per Source-1 entity, with singleton entities included in the macro average.
+Resolve each Source-1 entity to zero, one, or multiple Source-2/Source-3 entities while preserving the submission contract. The optimization metric is macro F0.5 over Source-1 entities.
+
+Data handling
+
+The pipeline reads only the supplied challenge TSV files. It does not call external entity databases, geocoders, registries, business APIs, or web enrichment services. Git-LFS pointer files are rejected before processing.
 
 Preprocessing
 
-Business names are Unicode-normalized, case-folded and legal-suffix canonicalized. The normalization covers common US/India forms and French legal suffixes such as SASU, SCI, SNC and EIRL.
+Names are Unicode-normalized, case-folded, and canonicalized for common legal-form variants. Addresses are normalized with conservative aliases, structured components, house-number extraction, postal-code extraction, and landmark filler removal. The normalization rules are deterministic and data-independent.
 
-Addresses are normalized with deterministic street aliases and address aliases. Structured components include street number, street body, city when an explicit delimiter supports a conservative boundary, and postal code. Landmark filler terms such as “near”, “opposite”, “beside” and “next to” are removed from address text before comparison. No geocoder or external address database is used.
+Candidate generation
 
-Blocking and candidate generation
+Candidate generation combines deterministic lexical blocking with an independent semantic retrieval route. Lexical blocking uses exact and near-exact keys, rare-token filtering, phonetic keys, address structure, and MinHash/LSH. Oversized blocks are handled by a relevance-aware rescue stage instead of arbitrary ID truncation.
 
-Blocking uses multiple independent retrieval paths:
+The semantic route uses a Sentence-Transformers BGE bi-encoder, normalized embeddings, and a FAISS HNSW inner-product index. For each Source-1 entity it retrieves a bounded semantic neighborhood and unions those candidates with the lexical candidates.
 
-exact normalized full/core/sorted names
-
-acronyms
-
-exact and tokenized addresses
-
-postal codes and street numbers
-
-rare name tokens
-
-phonetic/Soundex keys
-
-character n-gram MinHash-LSH
-
-bounded retrieval from oversized frequency buckets
-
-Keys above the configured frequency ceiling are discarded from the unrestricted join rather than truncated by entity-ID position. Oversized buckets are handled only through bounded relevance-aware rescue.
-
-The final candidate set has a hard maximum but is not padded to that maximum. Weak candidates can be removed by the validated adaptive selection policy.
-
-candidate_pairs.tsv is generated from the same final candidate table that feeds feature computation and model inference.
+The final candidate set has a configurable hard TOP_K ceiling. Those exact final candidates are the only pairs materialized into the feature matrix and the only pairs eligible for prediction.
 
 Features
 
-The pair representation contains 65 features covering:
+The matcher uses lexical, structured-address, country, retrieval-rank, reciprocal-rank, cross-source corroboration, learned variation, semantic similarity, semantic rank, semantic/lexical alignment, and bounded cross-encoder reranking features.
 
-exact and fuzzy name/address similarity
+Matching model
 
-token-set, token-sort and partial similarity
+The model layer supports LightGBM, a linear logistic model, and a calibrated probability ensemble. The tuning stage measures model variants on the leakage-safe validation splits and optimizes the grouped macro-F0.5 threshold on the same Source-1 grouping used by the metric.
 
-character-trigram cosine similarity
+Inference uses the tuned threshold through a single entity-level policy. No post-tuning margin or threshold offset is inserted unless it was explicitly measured during tuning.
 
-token overlap and containment
+Cache correctness
 
-postal-code and street-number agreement/conflict
+SQLite candidate stores and feature matrices are invalidated when dataset signatures, feature counts, semantic configuration, or relevant source-module hashes change. Materialized matrices carry sidecar metadata so a stale feature layout cannot be silently reused.
 
-structured street/city comparisons
+Reproducibility
 
-legal-suffix consistency
+All behavior is controlled by code and configuration, not entity-specific IDs or hand-written exceptions. Semantic model names, ANN settings, batch sizes, reranking depth, and device selection can be overridden through environment variables.
 
-acronym relationships
+Runtime requirements
 
-missingness
+The production semantic path requires sentence-transformers and faiss-cpu from requirements.txt. For deterministic unit tests only, semantic retrieval is disabled in the test configuration.
 
-country match/conflict
+Evaluation artifacts
 
-retrieval evidence and candidate rank
-
-name-vs-address ranking agreement
-
-reciprocal candidate rank and mutual-best signal
-
-cross-source corroboration
-
-training-derived lexical-variation scores
-
-The training-derived variation model is fit only from positive training pairs inside the appropriate training fold, avoiding validation-label leakage.
-
-Models and tuning
-
-The first real validation run is intentionally an untuned baseline using the LightGBM pair classifier and fixed threshold 0.5. This establishes a reproducible evidence baseline before any weighting, ensemble or decision-policy choice is retained.
-
-The post-baseline tuning stage evaluates:
-
-unweighted LightGBM
-
-balanced LightGBM
-
-moderate scale_pos_weight
-
-a standardized logistic regression model
-
-probability ensemble variants
-
-training-derived lexical variation
-
-Thresholds are optimized against grouped macro F0.5 rather than ordinary pairwise accuracy.
-
-The selected production policy is evaluated across:
-
-in-distribution Source-1 splits
-
-country holdout
-
-reverse-country holdout
-
-and stores country-specific and unseen-country decision policies.
-
-Decisioning
-
-The final decision is made per Source-1 entity rather than independently for every pair.
-
-The policy supports:
-
-high-confidence acceptance
-
-lower-confidence rejection
-
-an ambiguity band
-
-a stricter requirement for additional matches
-
-a hard maximum number of matches
-
-minimum absolute score
-
-The decision layer operates only on candidates already present in candidate_pairs.tsv; it cannot introduce an out-of-candidate match.
-
-Validation and reproducibility
-
-Run the pipeline in this order:
-
-python run.py --mode validate
-python run.py --mode tune
-python run.py --mode predict --check-submission
-
-The baseline validation produces scratch/validation_report.json. The tuning stage produces scratch/tuned_policy.json and scratch/decision_policy.json. Prediction writes:
-
-output/matching_results.tsv
-output/candidate_pairs.tsv
-
-The official challenge validator is run with --check-ids before a submission package is considered ready.
-
-Fair play
-
-The implementation uses only the supplied challenge records and labels. It performs no external business lookup, registry search, geocoding, commercial API lookup, or web-based entity enrichment.
+Real-data validation measurements are written to scratch/validation_report.json and tuning results to scratch/tuned_policy.json. Repository documentation intentionally does not copy those measurements so that synthetic smoke-test results cannot be mistaken for challenge results.

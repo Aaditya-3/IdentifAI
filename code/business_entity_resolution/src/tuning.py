@@ -18,6 +18,7 @@ import numpy as np
 
 from .decision import optimize_grouped_threshold, choose_hysteresis_policy
 from .model import LinearPairModel, PairModel, ProbabilityEnsemble
+from .semantic_retrieval import SemanticConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +40,34 @@ def _matrix_paths(scratch: Path, name: str, labels: bool, feature_count: int):
     return x_path, pairs_path, y_path
 
 
-def _existing_matrix(pipeline_module, scratch: Path, name: str, labels: bool):
+def _existing_matrix(pipeline_module, store, scratch: Path, name: str, labels: bool):
     MatrixFiles = pipeline_module.MatrixFiles
     feature_count = len(pipeline_module.FEATURE_NAMES)
     x_path, pairs_path, y_path = _matrix_paths(scratch, name, labels, feature_count)
     if not x_path.exists() or not pairs_path.exists():
+        return None
+    meta_path = scratch / f"{name}.meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    current_signature_row = store.connection.execute(
+        "SELECT value FROM pipeline_meta WHERE key='signature'"
+    ).fetchone()
+    expected_store_signature = current_signature_row[0] if current_signature_row else None
+    expected_semantic = SemanticConfig.from_environment(top_k=store.top_k).signature()
+    expected_modules = pipeline_module._module_signature(
+        "features.py", "variation.py", "semantic_retrieval.py"
+    )
+    if (
+        meta.get("cache_schema") != pipeline_module.CACHE_SCHEMA_VERSION
+        or meta.get("feature_count") != feature_count
+        or meta.get("store_signature") != expected_store_signature
+        or meta.get("semantic_config") != expected_semantic
+        or meta.get("module_signatures") != expected_modules
+    ):
         return None
     width = feature_count * np.dtype(np.float32).itemsize
     if width <= 0 or x_path.stat().st_size % width:
@@ -65,7 +89,7 @@ def _load_matrix(
     subsample: bool,
     variation_model=None,
 ):
-    existing = _existing_matrix(pipeline_module, scratch, name, labels)
+    existing = _existing_matrix(pipeline_module, store, scratch, name, labels)
     # A variation-enabled matrix cannot safely reuse a baseline matrix with the
     # same name.  Tune names are therefore unique and explicit.
     if existing is not None and variation_model is None:
@@ -289,29 +313,28 @@ def tune(
         selected_reverse = float(cross_results[selected_name]["reverse_country_holdout"]["threshold"])
         selected_id = float(results[selected_name]["threshold"])
 
-        # The threshold itself is measured from grouped macro-F0.5.  The
-        # entity-level hysteresis parameters remain conservative defaults here;
-        # they are part of the policy contract and are fully wired into prediction.
-        # They can be tuned in a later measured experiment without changing the
-        # baseline gate.
+        # Keep inference exactly aligned with the threshold that was optimized
+        # on grouped macro-F0.5.  Entity-level filtering remains available for
+        # max-match and evidence-aware safeguards, but no unmeasured margin is
+        # introduced after tuning.
         country_policy = choose_hysteresis_policy(
             selected_country,
-            ambiguous_margin=0.03,
-            second_match_delta=0.04,
+            ambiguous_margin=0.0,
+            second_match_delta=0.0,
             max_matches=top_k,
             min_absolute_score=0.0,
         )
         reverse_policy = choose_hysteresis_policy(
             selected_reverse,
-            ambiguous_margin=0.03,
-            second_match_delta=0.04,
+            ambiguous_margin=0.0,
+            second_match_delta=0.0,
             max_matches=top_k,
             min_absolute_score=0.0,
         )
         id_policy = choose_hysteresis_policy(
             selected_id,
-            ambiguous_margin=0.03,
-            second_match_delta=0.04,
+            ambiguous_margin=0.0,
+            second_match_delta=0.0,
             max_matches=top_k,
             min_absolute_score=0.0,
         )

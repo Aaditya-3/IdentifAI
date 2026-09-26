@@ -23,8 +23,25 @@ except ImportError:
 # Therefore parents[2] == <repo>
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_TRAIN_DIR = REPO_ROOT / "student_resource" / "dataset" / "train"
-DEFAULT_TEST_DIR = REPO_ROOT / "student_resource" / "dataset" / "test"
+
+def _discover_dataset_dir(split: str) -> Path:
+    """Find a conventional materialized dataset directory without assuming one layout."""
+    required = [f"{split}_source{i}.tsv" for i in (1, 2, 3)]
+    candidates = (
+        REPO_ROOT / "dataset" / split,
+        REPO_ROOT / "data" / split,
+        REPO_ROOT / "student_resource" / "dataset" / split,
+        REPO_ROOT / split,
+        REPO_ROOT,
+    )
+    for candidate in candidates:
+        if candidate.is_dir() and all((candidate / name).is_file() for name in required):
+            return candidate
+    # Keep the historical challenge path as the final diagnostic target when no
+    # dataset is present yet; _resolve_dir then raises a precise error.
+    return REPO_ROOT / "student_resource" / "dataset" / split
+
+
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output"
 DEFAULT_SCRATCH_DIR = REPO_ROOT / "scratch"
 
@@ -83,7 +100,7 @@ def main() -> None:
         default=None,
         help=(
             "Training dataset directory. "
-            "Defaults to student_resource/dataset/train."
+            "Defaults to the first conventional materialized train dataset found in the repository."
         ),
     )
 
@@ -92,7 +109,7 @@ def main() -> None:
         default=None,
         help=(
             "Training dataset directory for predict mode. "
-            "Defaults to --data_dir or student_resource/dataset/train."
+            "Defaults to --data_dir or the discovered train dataset."
         ),
     )
 
@@ -101,7 +118,7 @@ def main() -> None:
         default=None,
         help=(
             "Test dataset directory. "
-            "Defaults to student_resource/dataset/test."
+            "Defaults to the first conventional materialized test dataset found in the repository."
         ),
     )
 
@@ -157,23 +174,29 @@ def main() -> None:
     # Resolve canonical paths
     # ---------------------------------------------------------
 
-    data_dir = _resolve_dir(
-        args.data_dir,
-        default=DEFAULT_TRAIN_DIR,
-        description="training dataset",
-    )
-
-    train_dir = _resolve_dir(
-        args.train_dir,
-        default=data_dir,
-        description="training dataset",
-    )
+    if args.mode == "predict":
+        # Predict mode can be run with an explicit --train_dir even when the
+        # repository itself contains no dataset. Do not resolve --data_dir first.
+        train_default = Path(args.data_dir).expanduser() if args.data_dir else _discover_dataset_dir("train")
+        train_dir = _resolve_dir(
+            args.train_dir,
+            default=train_default,
+            description="training dataset",
+        )
+        data_dir = train_dir
+    else:
+        data_dir = _resolve_dir(
+            args.data_dir,
+            default=_discover_dataset_dir("train"),
+            description="training dataset",
+        )
+        train_dir = data_dir
 
     test_dir = None
     if args.mode == "predict":
         test_dir = _resolve_dir(
             args.test_dir,
-            default=DEFAULT_TEST_DIR,
+            default=_discover_dataset_dir("test"),
             description="test dataset",
         )
 

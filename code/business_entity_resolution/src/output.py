@@ -137,6 +137,8 @@ def write_submission_from_store_streaming(
     idx_bridge = FEATURE_NAMES.index("opposite_source_bridge")
     idx_alias = FEATURE_NAMES.index("learned_name_alias")
     idx_address_alias = FEATURE_NAMES.index("learned_address_alias")
+    idx_semantic = FEATURE_NAMES.index("semantic_similarity")
+    idx_rerank = FEATURE_NAMES.index("cross_encoder_score")
 
     def _policy_for_country(country: str) -> DecisionPolicy:
         normalized = (country or "").casefold()
@@ -222,6 +224,7 @@ def write_submission_from_store_streaming(
             feature_matrix = feature_batch(
                 [row[:-1] for row in batch],
                 variation_model=variation_model,
+                semantic_retriever=store.semantic_retriever,
             )
             probs = model.predict_proba(feature_matrix)
             if len(probs) != len(batch):
@@ -252,6 +255,8 @@ def write_submission_from_store_streaming(
                         "opposite_source_bridge": float(feature_vector[idx_bridge]),
                         "learned_name_alias": float(feature_vector[idx_alias]),
                         "learned_address_alias": float(feature_vector[idx_address_alias]),
+                        "semantic_score": float(feature_vector[idx_semantic]),
+                        "cross_encoder_score": float(feature_vector[idx_rerank]),
                     }
                 )
                 consumed_pairs += 1

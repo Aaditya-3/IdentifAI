@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from src.blocking import BlockingStore
 from src.features import FEATURE_NAMES, feature_batch
 from src.metrics import macro_f0_5
@@ -582,3 +584,89 @@ class TestDeterminism(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_semantic_feature_stub_is_consumed():
+    from business_entity_resolution.src.features import FEATURE_NAMES, feature_batch
+
+    class StubRetriever:
+        def rerank(self, pairs):
+            return np.asarray([0.91 for _ in pairs], dtype=np.float32)
+
+    # Build the current 32-column candidate-row shape used by feature_batch.
+    row = [
+        "S1-1", "S2-1",
+        "gb", "acme ltd", "acme", "acme", "221b baker street", "221b",
+        "gb", "acme limited", "acme limited", "acme limited", "221b baker street", "221b",
+        0.7, 0.95, 1, 0.88, 1,
+        "221b", "baker street", "london", "nw1 6xe",
+        "221b", "baker street", "london", "nw1 6xe",
+        1, 1, 1, 1.0, 1.0,
+    ]
+    matrix = feature_batch([row], semantic_retriever=StubRetriever())
+    assert matrix.shape == (1, len(FEATURE_NAMES))
+    assert np.isclose(float(matrix[0, FEATURE_NAMES.index("semantic_similarity")]), 0.88)
+    assert np.isclose(float(matrix[0, FEATURE_NAMES.index("cross_encoder_score")]), 0.91)
+
+
+def test_semantic_retriever_real_backend_contract_with_stubs(monkeypatch):
+    import sys
+    import types
+
+    class FakeEncoder:
+        def __init__(self, model_name, device=None):
+            self.model_name = model_name
+
+        def encode(self, texts, **kwargs):
+            vectors = []
+            for text in texts:
+                token = text.split()[0] if text.split() else ""
+                value = float(sum(map(ord, token)) % 997) / 997.0
+                vectors.append([1.0, value, value * value, 0.5])
+            return np.asarray(vectors, dtype=np.float32)
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name, activation_fn=None, device=None):
+            self.model_name = model_name
+
+        def predict(self, pairs, **kwargs):
+            return np.asarray([0.93] * len(pairs), dtype=np.float32)
+
+    class FakeHNSW: 
+        def __init__(self, dimension, m, metric):
+            self.dimension = dimension
+            self.vectors = np.empty((0, dimension), dtype=np.float32)
+            self.hnsw = types.SimpleNamespace(efConstruction=0, efSearch=0)
+
+        def add(self, values):
+            self.vectors = np.vstack([self.vectors, np.asarray(values, dtype=np.float32)])
+
+        def search(self, queries, k):
+            scores = np.asarray(queries, dtype=np.float32) @ self.vectors.T
+            indices = np.argsort(-scores, axis=1, kind="stable")[:, :k]
+            distances = np.take_along_axis(scores, indices, axis=1)
+            return distances, indices
+
+    fake_st = types.ModuleType("sentence_transformers")
+    fake_st.SentenceTransformer = FakeEncoder
+    fake_st.CrossEncoder = FakeCrossEncoder
+    fake_faiss = types.ModuleType("faiss")
+    fake_faiss.METRIC_INNER_PRODUCT = 0
+    fake_faiss.IndexHNSWFlat = FakeHNSW
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+    monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
+
+    from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+    retriever = SemanticRetriever(SemanticConfig(enabled=True, encode_batch_size=2, semantic_top_k=2, rerank_top_k=1))
+    retriever.build([
+        ("T1", "business name: alpha; business address: one"),
+        ("T2", "business name: beta; business address: two"),
+    ])
+    results = retriever.query([("S1", "business name: alpha; business address: one")], top_k=2)
+    assert retriever.using_real_backend
+    assert results[0][0] == "S1"
+    assert results[0][1] == "T1"
+    scores = retriever.rerank([("query", "document", 1), ("query", "document2", 2)])
+    assert np.allclose(scores, [0.93, 0.0])
+    retriever.close()

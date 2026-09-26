@@ -24,6 +24,7 @@ from .features import FEATURE_NAMES, feature_batch
 from .decision import DecisionPolicy
 from .metrics import f05_from_counts
 from .model import LinearPairModel, PairModel, ProbabilityEnsemble
+from .semantic_retrieval import SemanticConfig
 from .variation import VariationModel
 from .output import (
     validate_output_against_store,
@@ -34,7 +35,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = BlockingStore.TOP_K
 BASELINE_THRESHOLD = 0.5
-CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v11-wired"
+CACHE_SCHEMA_VERSION = "2026-09-27-entity-resolution-v12-semantic"
 
 
 @dataclass(frozen=True)
@@ -121,8 +122,9 @@ def _store_signature(data_dir: str | Path, split: str, top_k: int, with_truth: b
             "final_score_margin": BlockingStore.FINAL_SCORE_MARGIN,
         },
         "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "semantic_config": SemanticConfig.from_environment(top_k=top_k).signature(),
         "code_signatures": _module_signature(
-            "blocking.py", "preprocessing.py", "features.py", "variation.py", "model.py", "decision.py", "tuning.py", "pipeline.py"
+            "blocking.py", "preprocessing.py", "features.py", "variation.py", "model.py", "decision.py", "semantic_retrieval.py", "tuning.py", "pipeline.py"
         ),
     }
 
@@ -246,18 +248,39 @@ def _materialize(
             if not batch:
                 break
             x[written : written + len(batch)] = feature_batch(
-                [row[:-1] for row in batch], variation_model=variation_model
+                [row[:-1] for row in batch],
+                variation_model=variation_model,
+                semantic_retriever=store.semantic_retriever,
             )
             if y is not None:
                 y[written : written + len(batch)] = [row[-1] for row in batch]
             pair_file.writelines(f"{row[0]}\t{row[1]}\n" for row in batch)
             written += len(batch)
 
-    x.flush()
+    if hasattr(x, "flush"):
+        x.flush()
     if y is not None and hasattr(y, "flush"):
         y.flush()
     if written != rows:
         raise AssertionError(f"Materialization wrote {written} rows but expected {rows}")
+
+    signature_row = store.connection.execute(
+        "SELECT value FROM pipeline_meta WHERE key='signature'"
+    ).fetchone()
+    matrix_meta = {
+        "cache_schema": CACHE_SCHEMA_VERSION,
+        "rows": rows,
+        "feature_count": len(FEATURE_NAMES),
+        "store_signature": signature_row[0] if signature_row else None,
+        "semantic_config": SemanticConfig.from_environment(top_k=store.top_k).signature(),
+        "module_signatures": _module_signature(
+            "features.py", "variation.py", "semantic_retrieval.py"
+        ),
+    }
+    (scratch / f"{name}.meta.json").write_text(
+        json.dumps(matrix_meta, sort_keys=True),
+        encoding="utf-8",
+    )
     LOGGER.info("Materialized %s: %d rows x %d features", name, rows, len(FEATURE_NAMES))
     return MatrixFiles(x_path, y_path, pairs_path, rows)
 
@@ -380,23 +403,58 @@ def _pair_precision_recall(
     return precision, recall
 
 
-def _write_measured_documentation(report: dict) -> Path:
-    """Write Documentation.md with the completed real-data baseline numbers."""
+def _write_methodology_documentation() -> Path:
+    """Write repository documentation without embedding run-specific measurements."""
     repo_root = Path(__file__).resolve().parents[3]
     path = repo_root / "Documentation.md"
-    blocking = report.get("blocking", {})
-    raw = blocking.get("raw_blocking", {})
-    final = blocking.get("final", {})
-    stats = blocking.get("final_stats", {})
-    rows = []
-    for country, metrics in report.get("per_country_candidate_diagnostics", {}).items():
-        rows.append(
-            f"| {country} | {metrics.get('pair_recall', 0):.6f} | "
-            f"{metrics.get('complete_match_set_recall', 0):.6f} | "
-            f"{metrics.get('candidate_avg', 0):.2f} | {metrics.get('candidate_pairs', 0):,} |"
-        )
-    country_table = "\n".join(rows) or "| no country diagnostics | - | - | - | - |"
-    text = f"""# Business Entity Resolution Challenge — Methodology and Measured Baseline\n\n## Objective\n\nThe pipeline resolves each Source-1 record to zero, one, or many Source-2/Source-3 records using only the supplied challenge data. The competition metric is macro F0.5 per Source-1 entity.\n\n## Preprocessing and blocking\n\nNames are Unicode-normalized, case-folded and legal-suffix canonicalized. Addresses are normalized with deterministic street/address aliases and conservative structured components. Blocking uses exact/near-exact keys, rare tokens, phonetic keys, address numbers/postal codes, and MinHash-LSH. Keys above the frequency ceiling are not truncated by arbitrary ID order.\n\nThe final candidate set is adaptive with a hard TOP_K ceiling and is exactly the set passed to the matching model.\n\n## Features\n\nThe baseline uses {report.get('feature_count', 0)} pair features covering exact/fuzzy name and address similarity, token similarity, acronym/legal-suffix signals, address components, country consistency, missingness, retrieval evidence, cross-field rank agreement, and reciprocal candidate rank.\n\n## Baseline model\n\nThe first required real-data run is intentionally untuned: unweighted LightGBM and a fixed decision threshold of 0.5. No class-weight ablation, ensemble, hysteresis tuning or pseudo-labeling is applied before this baseline report exists.\n\n## Measured real-data baseline\n\n- Overall final candidate pairs: **{report.get('candidate_pairs', 0):,}**\n- Average final candidates/S1: **{report.get('average_candidates_per_s1', 0.0):.2f}**\n- Raw pair recall: **{raw.get('recall', 0.0):.6f}**\n- Raw complete-match-set recall: **{raw.get('complete_match_set_recall', 0.0):.6f}**\n- Final pair recall: **{final.get('recall', 0.0):.6f}**\n- Final complete-match-set recall: **{final.get('complete_match_set_recall', 0.0):.6f}**\n- Final p95 candidates/S1: **{stats.get('p95', 0)}**\n- Final p99 candidates/S1: **{stats.get('p99', 0)}**\n- Runtime: **{report.get('runtime_seconds', 0.0):.1f} seconds**\n\n### Validation views\n\n| View | Macro F0.5 | Precision | Recall |\n|---|---:|---:|---:|\n| Country holdout | {report.get('country_holdout', {}).get('macro_f0_5', 0.0):.6f} | {report.get('country_holdout', {}).get('precision', 0.0):.6f} | {report.get('country_holdout', {}).get('recall', 0.0):.6f} |\n| Reverse country | {report.get('reverse_country_holdout', {}).get('macro_f0_5', 0.0):.6f} | {report.get('reverse_country_holdout', {}).get('precision', 0.0):.6f} | {report.get('reverse_country_holdout', {}).get('recall', 0.0):.6f} |\n| In-distribution | {report.get('in_distribution', {}).get('macro_f0_5', 0.0):.6f} | {report.get('in_distribution', {}).get('precision', 0.0):.6f} | {report.get('in_distribution', {}).get('recall', 0.0):.6f} |\n\n### Candidate diagnostics by Source-1 country\n\n| Country | Pair recall | Complete-set recall | Avg candidates/S1 | Candidate pairs |\n|---|---:|---:|---:|---:|\n{country_table}\n\n## Next stage\n\nThis completed real baseline is the evidence gate for subsequent tuning. Any new threshold, model weighting, ensemble, decision rule or pseudo-labeling strategy must be compared against these real held-out numbers before being retained.\n\n## Fair play\n\nNo external entity databases, APIs, geocoders, registries or web enrichment are used.\n"""
+    text = """# Business Entity Resolution Pipeline — Methodology
+
+## Objective
+
+Resolve each Source-1 entity to zero, one, or multiple Source-2/Source-3 entities while preserving the submission contract. The optimization metric is macro F0.5 over Source-1 entities.
+
+## Data handling
+
+The pipeline reads only the supplied challenge TSV files. It does not call external entity databases, geocoders, registries, business APIs, or web enrichment services. Git-LFS pointer files are rejected before processing.
+
+## Preprocessing
+
+Names are Unicode-normalized, case-folded, and canonicalized for common legal-form variants. Addresses are normalized with conservative aliases, structured components, house-number extraction, postal-code extraction, and landmark filler removal. The normalization rules are deterministic and data-independent.
+
+## Candidate generation
+
+Candidate generation combines deterministic lexical blocking with an independent semantic retrieval route. Lexical blocking uses exact and near-exact keys, rare-token filtering, phonetic keys, address structure, and MinHash/LSH. Oversized blocks are handled by a relevance-aware rescue stage instead of arbitrary ID truncation.
+
+The semantic route uses a Sentence-Transformers BGE bi-encoder, normalized embeddings, and a FAISS HNSW inner-product index. For each Source-1 entity it retrieves a bounded semantic neighborhood and unions those candidates with the lexical candidates.
+
+The final candidate set has a configurable hard TOP_K ceiling. Those exact final candidates are the only pairs materialized into the feature matrix and the only pairs eligible for prediction.
+
+## Features
+
+The matcher uses lexical, structured-address, country, retrieval-rank, reciprocal-rank, cross-source corroboration, learned variation, semantic similarity, semantic rank, semantic/lexical alignment, and bounded cross-encoder reranking features.
+
+## Matching model
+
+The model layer supports LightGBM, a linear logistic model, and a calibrated probability ensemble. The tuning stage measures model variants on the leakage-safe validation splits and optimizes the grouped macro-F0.5 threshold on the same Source-1 grouping used by the metric.
+
+Inference uses the tuned threshold through a single entity-level policy. No post-tuning margin or threshold offset is inserted unless it was explicitly measured during tuning.
+
+## Cache correctness
+
+SQLite candidate stores and feature matrices are invalidated when dataset signatures, feature counts, semantic configuration, or relevant source-module hashes change. Materialized matrices carry sidecar metadata so a stale feature layout cannot be silently reused.
+
+## Reproducibility
+
+All behavior is controlled by code and configuration, not entity-specific IDs or hand-written exceptions. Semantic model names, ANN settings, batch sizes, reranking depth, and device selection can be overridden through environment variables.
+
+## Runtime requirements
+
+The production semantic path requires `sentence-transformers` and `faiss-cpu` from `requirements.txt`. For deterministic unit tests only, semantic retrieval is disabled in the test configuration.
+
+## Evaluation artifacts
+
+Real-data validation measurements are written to `scratch/validation_report.json` and tuning results to `scratch/tuned_policy.json`. Repository documentation intentionally does not copy those measurements so that synthetic smoke-test results cannot be mistaken for challenge results.
+"""
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -527,7 +585,6 @@ def validate(
         report = {
             "status": "completed",
             "baseline_only": True,
-            "macro_f05_target": 0.98,
             "decision_policy": policy,
             "country_holdout": {
                 "train_country": train_country,
@@ -570,8 +627,8 @@ def validate(
         }
         report_path = scratch / "validation_report.json"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        documentation_path = _write_measured_documentation(report)
-        LOGGER.info("Wrote measured methodology document: %s", documentation_path)
+        documentation_path = _write_methodology_documentation()
+        LOGGER.info("Wrote methodology document: %s", documentation_path)
 
         LOGGER.info(
             "Baseline validation complete: country F0.5=%.6f, reverse=%.6f, ID=%.6f [%.1fs]",

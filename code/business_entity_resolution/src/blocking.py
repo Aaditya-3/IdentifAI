@@ -36,6 +36,7 @@ from .preprocessing import (
     normalize_name,
     parse_address_components,
 )
+from .semantic_retrieval import SemanticConfig, SemanticRetriever, entity_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,9 +75,14 @@ class BlockingStore:
         self._common_token_set: set[str] | None = None
         self._active_key_hashes: np.ndarray | None = None
         self.diagnostics: dict = {}
+        self.semantic_config = SemanticConfig.from_environment(top_k=self.top_k)
+        self.semantic_retriever = SemanticRetriever(self.semantic_config)
 
     def close(self) -> None:
-        self.connection.close()
+        try:
+            self.semantic_retriever.close()
+        finally:
+            self.connection.close()
 
     def reset(self) -> None:
         self.connection.executescript("""
@@ -95,6 +101,7 @@ class BlockingStore:
             DROP TABLE IF EXISTS final_candidates;
             DROP TABLE IF EXISTS truth;
             DROP TABLE IF EXISTS pipeline_meta;
+            DROP TABLE IF EXISTS semantic_index_map;
         """)
         self.connection.executescript("""
             CREATE TABLE source1 (
@@ -120,6 +127,8 @@ class BlockingStore:
                 address_evidence REAL NOT NULL DEFAULT 0.0,
                 structural_evidence REAL NOT NULL DEFAULT 0.0,
                 exact_evidence REAL NOT NULL DEFAULT 0.0,
+                semantic_score REAL NOT NULL DEFAULT 0.0,
+                semantic_rank INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (source1_id, target_id)
             ) WITHOUT ROWID;
             CREATE TABLE truth (
@@ -466,7 +475,9 @@ class BlockingStore:
                 name_evidence,
                 address_evidence,
                 structural_evidence,
-                exact_evidence
+                exact_evidence,
+                semantic_score,
+                semantic_rank
             )
             SELECT
                 b.entity_id,
@@ -497,7 +508,9 @@ class BlockingStore:
                       OR b.key LIKE 'core:%'
                       OR b.key LIKE 'sorted:%'
                       OR b.key LIKE 'address:%'
-                    THEN b.weight * t.weight ELSE 0.0 END) AS exact_evidence
+                    THEN b.weight * t.weight ELSE 0.0 END) AS exact_evidence,
+                0.0 AS semantic_score,
+                0 AS semantic_rank
             FROM bounded_target_keys t
             JOIN bounded_keys b ON b.key = t.key
             GROUP BY b.entity_id, t.target_id
@@ -510,6 +523,60 @@ class BlockingStore:
                 exact_evidence = MAX(raw_candidates.exact_evidence, excluded.exact_evidence)
         """)
         self._rescue_high_frequency_keys()
+
+        # Independent semantic retrieval route: BGE bi-encoder + FAISS HNSW.
+        # It augments, rather than replaces, deterministic lexical blocking.
+        if self.semantic_config.enabled:
+            target_iter = (
+                (row[0], entity_text(row[2], row[5], row[1]))
+                for row in self.connection.execute(
+                    "SELECT entity_id, country, name, core, sorted_core, address FROM targets ORDER BY entity_id"
+                )
+            )
+            self.semantic_retriever.build(target_iter)
+            source_iter = (
+                (row[0], entity_text(row[2], row[5], row[1]))
+                for row in self.connection.execute(
+                    "SELECT entity_id, country, name, core, sorted_core, address FROM source1 ORDER BY entity_id"
+                )
+            )
+            semantic_rows = self.semantic_retriever.query(
+                source_iter, top_k=self.semantic_config.semantic_top_k
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO raw_candidates(
+                    source1_id, target_id, evidence, support_count,
+                    name_evidence, address_evidence, structural_evidence, exact_evidence,
+                    semantic_score, semantic_rank
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source1_id, target_id) DO UPDATE SET
+                    evidence = MAX(raw_candidates.evidence, excluded.evidence),
+                    support_count = raw_candidates.support_count + excluded.support_count,
+                    semantic_score = MAX(raw_candidates.semantic_score, excluded.semantic_score),
+                    semantic_rank = CASE
+                        WHEN raw_candidates.semantic_rank = 0 THEN excluded.semantic_rank
+                        ELSE MIN(raw_candidates.semantic_rank, excluded.semantic_rank)
+                    END
+                """,
+                (
+                    (sid, tid, max(0.0, score), 1, 0.0, 0.0, 0.0, 0.0, float(score), int(rank))
+                    for sid, tid, score, rank in semantic_rows
+                ),
+            )
+            self.connection.commit()
+            self.diagnostics["semantic_retrieval"] = {
+                "enabled": True,
+                "backend": "bge_faiss_hnsw" if self.semantic_retriever.using_real_backend else "deterministic_fallback",
+                "embedding_model": self.semantic_config.embedding_model,
+                "semantic_top_k": self.semantic_config.semantic_top_k,
+                "rerank_top_k": self.semantic_config.rerank_top_k,
+                "hnsw_ef_search": self.semantic_config.hnsw_ef_search,
+                "retrieved_rows": len(semantic_rows),
+            }
+        else:
+            self.diagnostics["semantic_retrieval"] = {"enabled": False}
+
         self.connection.execute("DROP TABLE all_target_keys")
         self.connection.execute("DROP TABLE bounded_target_keys")
         self.connection.execute("DROP TABLE high_freq_source_keys")
@@ -616,14 +683,17 @@ class BlockingStore:
                             address_signal,
                             structural_signal,
                             exact_signal,
+                            0.0,
+                            0,
                         ))
 
                     self.connection.executemany(
                         """INSERT INTO raw_candidates(
                                source1_id, target_id, evidence, support_count,
-                               name_evidence, address_evidence,
-                               structural_evidence, exact_evidence
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                   name_evidence, address_evidence,
+                               structural_evidence, exact_evidence,
+                               semantic_score, semantic_rank
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(source1_id, target_id) DO UPDATE SET
                                evidence=MAX(raw_candidates.evidence, excluded.evidence),
                                support_count=raw_candidates.support_count + excluded.support_count,
@@ -693,22 +763,16 @@ class BlockingStore:
         name_quota = max(1, self.top_k)
         address_quota = max(1, self.top_k)
         structural_quota = max(1, self.top_k // 2)
+        semantic_quota = (
+            min(shortlist_budget, max(self.top_k, self.semantic_config.semantic_top_k))
+            if self.semantic_config.enabled else 0
+        )
         lexical_name_quota = max(1, self.top_k + self.top_k // 2)
         lexical_address_quota = max(1, self.top_k + self.top_k // 2)
 
-        reserved_total = (
-            global_quota
-            + exact_quota
-            + name_quota
-            + address_quota
-            + structural_quota
-            + lexical_name_quota
-            + lexical_address_quota
-        )
-        if reserved_total > shortlist_budget:
-            raise AssertionError(
-                f"Shortlist allocation exceeds budget: reserved={reserved_total}, budget={shortlist_budget}"
-            )
+        # Route quotas are upper bounds; candidates overlap heavily across routes.
+        # The selector enforces the single shortlist budget while preserving the
+        # strongest evidence from each independent retrieval family.
 
         # Truth is consumed as an ordered stream only when diagnostics are
         # available. This avoids materializing the full ground-truth mapping in
@@ -754,6 +818,8 @@ class BlockingStore:
                 similarity REAL NOT NULL,
                 name_score REAL NOT NULL,
                 address_score REAL NOT NULL,
+                semantic_score REAL NOT NULL DEFAULT 0.0,
+                semantic_rank INTEGER NOT NULL DEFAULT 0,
                 rank INTEGER NOT NULL,
                 PRIMARY KEY (source1_id, target_id)
             ) WITHOUT ROWID;
@@ -771,6 +837,8 @@ class BlockingStore:
                 r.address_evidence,
                 r.structural_evidence,
                 r.exact_evidence,
+                r.semantic_score,
+                r.semantic_rank,
                 s.core,
                 s.address,
                 t.core,
@@ -795,9 +863,11 @@ class BlockingStore:
             selected: dict[str, tuple] = {}
 
             def _take(candidates: list[tuple], quota: int, key_fn) -> None:
-                if quota <= 0 or not candidates:
+                if quota <= 0 or not candidates or len(selected) >= shortlist_budget:
                     return
                 for row in heapq.nlargest(quota, candidates, key=key_fn):
+                    if len(selected) >= shortlist_budget:
+                        break
                     selected[row[1]] = row
 
             _take(rows, global_quota, lambda r: (r[2], r[3], r[1]))
@@ -805,15 +875,21 @@ class BlockingStore:
             _take(rows, name_quota, lambda r: (r[4], r[2], r[3], r[1]))
             _take(rows, address_quota, lambda r: (r[5], r[2], r[3], r[1]))
             _take(rows, structural_quota, lambda r: (r[6], r[3], r[2], r[1]))
+            if semantic_quota:
+                _take(
+                    rows,
+                    semantic_quota,
+                    lambda r: (r[8], -r[9] if r[9] else -10_000, r[2], r[1]),
+                )
 
             # Independent lexical retrieval directly over the raw block is the
             # key recall safeguard. A true match with weak blocking evidence can
             # still enter the shortlist when its normalized name/address is very
             # similar to the S1 record.
-            s_core = rows[0][8]
-            s_address = rows[0][9]
-            target_cores = [r[10] for r in rows]
-            target_addresses = [r[11] for r in rows]
+            s_core = rows[0][10]
+            s_address = rows[0][11]
+            target_cores = [r[12] for r in rows]
+            target_addresses = [r[13] for r in rows]
             target_lookup = {r[1]: r for r in rows}
 
             if s_core:
@@ -863,10 +939,10 @@ class BlockingStore:
                 return
 
             # Strong lexical scoring is now done only on the bounded shortlist.
-            n_left = [row[8] for row in shortlist_rows]
-            n_right = [row[10] for row in shortlist_rows]
-            a_left = [row[9] for row in shortlist_rows]
-            a_right = [row[11] for row in shortlist_rows]
+            n_left = [row[10] for row in shortlist_rows]
+            n_right = [row[12] for row in shortlist_rows]
+            a_left = [row[11] for row in shortlist_rows]
+            a_right = [row[13] for row in shortlist_rows]
 
             name_ratio = process.cpdist(
                 n_left, n_right, scorer=fuzz.ratio, dtype=np.uint8, workers=-1
@@ -896,16 +972,19 @@ class BlockingStore:
                 support_signal = min(int(row[3]), 4) / 4.0
                 structural_signal = 1.0 if float(row[6]) > 0 else 0.0
                 exact_signal = 1.0 if float(row[7]) > 0 else 0.0
+                semantic_signal = float(np.clip(row[8], 0.0, 1.0))
                 sim = (
-                    0.39 * float(n_s)
-                    + 0.39 * float(a_s)
-                    + 0.12 * ev_norm
+                    0.31 * float(n_s)
+                    + 0.31 * float(a_s)
+                    + 0.20 * semantic_signal
+                    + 0.08 * ev_norm
                     + 0.05 * exact_signal
                     + 0.05 * max(structural_signal, support_signal)
                 )
                 scored.append((
                     row[0], row[1], ev_norm, float(sim), float(n_s), float(a_s),
                     float(max(structural_signal, support_signal)), float(exact_signal),
+                    semantic_signal, int(row[9]) if row[9] else 0,
                 ))
 
             # Adaptive final selection.  The previous implementation always
@@ -946,6 +1025,7 @@ class BlockingStore:
                 for row in ordered:
                     strong = (
                         row[7] > 0.0
+                        or row[8] >= 0.90
                         or (row[4] >= 0.92 and row[5] >= 0.85)
                         or (row[4] >= 0.95 and row[5] >= 0.70)
                         or (row[5] >= 0.95 and row[4] >= 0.70)
@@ -990,13 +1070,16 @@ class BlockingStore:
                     final_complete_s1 += 1
 
             insert_buffer.extend(
-                (row[0], row[1], float(row[2]), float(row[3]), float(row[4]), float(row[5]), rank)
+                (
+                    row[0], row[1], float(row[2]), float(row[3]), float(row[4]),
+                    float(row[5]), float(row[8]), int(row[9]), rank
+                )
                 for rank, row in enumerate(chosen, start=1)
             )
 
             if len(insert_buffer) >= 20_000:
                 self.connection.executemany(
-                    "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,rank) VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,semantic_score,semantic_rank,rank) VALUES (?,?,?,?,?,?,?,?,?)",
                     insert_buffer,
                 )
                 insert_buffer.clear()
@@ -1021,7 +1104,7 @@ class BlockingStore:
 
         if insert_buffer:
             self.connection.executemany(
-                "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,rank) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,semantic_score,semantic_rank,rank) VALUES (?,?,?,?,?,?,?,?,?)",
                 insert_buffer,
             )
             insert_buffer.clear()
@@ -1129,7 +1212,7 @@ class BlockingStore:
                 r.source1_id, r.target_id,
                 s.country, s.name, s.core, s.sorted_core, s.address, s.numbers,
                 t.country, t.name, t.core, t.sorted_core, t.address, t.numbers,
-                r.evidence, r.similarity, r.rank,
+                r.evidence, r.similarity, r.rank, r.semantic_score, r.semantic_rank,
                 s.street_number, s.street, s.city, s.postal_code,
                 t.street_number, t.street, t.city, t.postal_code,
                 r.name_rank, r.address_rank, r.reverse_similarity_rank,
