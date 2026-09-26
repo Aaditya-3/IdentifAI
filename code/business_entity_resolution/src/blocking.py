@@ -527,22 +527,36 @@ class BlockingStore:
         # Independent semantic retrieval route: BGE bi-encoder + FAISS HNSW.
         # It augments, rather than replaces, deterministic lexical blocking.
         if self.semantic_config.enabled:
-            target_iter = (
-                (row[0], entity_text(row[2], row[5], row[1]))
-                for row in self.connection.execute(
-                    "SELECT entity_id, country, name, core, sorted_core, address FROM targets ORDER BY entity_id"
+            target_cursor = self.connection.execute(
+                "SELECT entity_id, country, name, core, sorted_core, address "
+                "FROM targets ORDER BY entity_id"
+            )
+            try:
+                target_iter = (
+                    (row[0], entity_text(row[2], row[5], row[1]))
+                    for row in target_cursor
                 )
+                self.semantic_retriever.build(target_iter)
+            finally:
+                # The semantic path may stop early when dependencies are unavailable.
+                # Explicitly close the SQLite cursor so later DROP TABLE statements
+                # cannot inherit a read lock.
+                target_cursor.close()
+
+            source_cursor = self.connection.execute(
+                "SELECT entity_id, country, name, core, sorted_core, address "
+                "FROM source1 ORDER BY entity_id"
             )
-            self.semantic_retriever.build(target_iter)
-            source_iter = (
-                (row[0], entity_text(row[2], row[5], row[1]))
-                for row in self.connection.execute(
-                    "SELECT entity_id, country, name, core, sorted_core, address FROM source1 ORDER BY entity_id"
+            try:
+                source_iter = (
+                    (row[0], entity_text(row[2], row[5], row[1]))
+                    for row in source_cursor
                 )
-            )
-            semantic_rows = self.semantic_retriever.query(
-                source_iter, top_k=self.semantic_config.semantic_top_k
-            )
+                semantic_rows = self.semantic_retriever.query(
+                    source_iter, top_k=self.semantic_config.semantic_top_k
+                )
+            finally:
+                source_cursor.close()
             self.connection.executemany(
                 """
                 INSERT INTO raw_candidates(
@@ -567,12 +581,13 @@ class BlockingStore:
             self.connection.commit()
             self.diagnostics["semantic_retrieval"] = {
                 "enabled": True,
-                "backend": "bge_faiss_hnsw" if self.semantic_retriever.using_real_backend else "deterministic_fallback",
+                "backend": self.semantic_retriever.backend,
                 "embedding_model": self.semantic_config.embedding_model,
                 "semantic_top_k": self.semantic_config.semantic_top_k,
                 "rerank_top_k": self.semantic_config.rerank_top_k,
                 "hnsw_ef_search": self.semantic_config.hnsw_ef_search,
                 "retrieved_rows": len(semantic_rows),
+                "fallback_reason": self.semantic_retriever.failure_reason,
             }
         else:
             self.diagnostics["semantic_retrieval"] = {"enabled": False}

@@ -40,7 +40,7 @@ All behavior is controlled by code and configuration, not entity-specific IDs or
 
 Runtime requirements
 
-The production semantic path requires sentence-transformers and faiss-cpu from requirements.txt. For deterministic unit tests only, semantic retrieval is disabled in the test configuration.
+The core pipeline remains runnable without transformer or FAISS packages. The optional semantic path uses sentence-transformers and faiss-cpu when installed and when compatible local/cached BGE weights are available. Network model downloads are disabled by default so offline training does not crash or stall; unavailable semantic assets cause the semantic route to fail open to lexical retrieval. The optional cross-encoder is disabled by default because applying a transformer reranker to millions of pairs is not a bounded runtime operation.
 
 Evaluation artifacts
 

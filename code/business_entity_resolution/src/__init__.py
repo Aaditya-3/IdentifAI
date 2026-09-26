@@ -1,2 +1,1 @@
-"""Business entity resolution pipeline."""
-
+"""Utility helpers for the business entity-resolution package."""

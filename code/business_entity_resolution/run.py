@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 try:  # Supports both ``python run.py`` from this directory and module execution.
@@ -151,8 +152,17 @@ def main() -> None:
         "--check-submission",
         action="store_true",
         help=(
-            "After predict, also run the official stdlib submission validator "
-            "with --check-ids. This can use substantial memory on the full test set."
+            "After predict, run the official stdlib submission-format validator. "
+            "The default check is memory-light and does not load all S2/S3 IDs."
+        ),
+    )
+
+    parser.add_argument(
+        "--check-submission-ids",
+        action="store_true",
+        help=(
+            "Also ask the official validator to verify that every target ID exists. "
+            "This is diagnostic only and can use substantial memory on the full test set."
         ),
     )
 
@@ -292,19 +302,35 @@ def main() -> None:
         f"(threshold={threshold:.6f})"
     )
 
-    if args.check_submission:
+    if args.check_submission or args.check_submission_ids:
         import subprocess
-        validator = Path(__file__).resolve().parent / "utils" / "validate_submission.py"
-        if not validator.exists():
-            raise FileNotFoundError(f"Official submission validator not found: {validator}")
+
+        validator_candidates = (
+            Path(__file__).resolve().parent / "utils" / "validate_submission.py",
+            Path(__file__).resolve().parent / "tests" / "validate_submission.py",
+            REPO_ROOT / "student_resource" / "utils" / "validate_submission.py",
+        )
+        validator = next((path for path in validator_candidates if path.exists()), None)
+        if validator is None:
+            raise FileNotFoundError(
+                "Official submission validator not found. Checked: "
+                + ", ".join(str(path) for path in validator_candidates)
+            )
+
         command = [
-            "python", str(validator),
+            sys.executable,
+            str(validator),
             "--matching", str(output_dir / "matching_results.tsv"),
             "--candidate", str(output_dir / "candidate_pairs.tsv"),
             "--test-dir", str(test_dir),
-            "--check-ids",
         ]
-        logging.info("Running official submission validator with --check-ids")
+        if args.check_submission_ids:
+            command.append("--check-ids")
+
+        logging.info(
+            "Running official submission validator%s",
+            " with --check-ids" if args.check_submission_ids else "",
+        )
         subprocess.run(command, check=True)
 
 

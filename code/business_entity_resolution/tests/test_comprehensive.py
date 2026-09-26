@@ -542,6 +542,37 @@ class TestModel(unittest.TestCase):
         self.assertEqual(ensemble.shape, (4,))
         self.assertTrue(np.all((ensemble >= 0.0) & (ensemble <= 1.0)))
 
+
+    def test_empty_model_slice_is_safe(self):
+        model = PairModel(random_state=7).fit(
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.int8),
+        )
+        probabilities = model.predict_proba(np.zeros((2, 3), dtype=np.float32))
+        self.assertTrue(np.allclose(probabilities, 0.0))
+
+    def test_lightgbm_failure_falls_back_without_crash(self):
+        import builtins
+
+        original_import = builtins.__import__
+
+        def failing_import(name, *args, **kwargs):
+            if name == "lightgbm":
+                raise OSError("simulated binary-load failure")
+            return original_import(name, *args, **kwargs)
+
+        original = builtins.__import__
+        builtins.__import__ = failing_import
+        try:
+            X = np.asarray([[0.0], [1.0], [0.2], [0.9]], dtype=np.float32)
+            y = np.asarray([0, 1, 0, 1], dtype=np.int8)
+            model = PairModel(random_state=7).fit(X, y)
+            probabilities = model.predict_proba(X)
+            self.assertEqual(probabilities.shape, (4,))
+            self.assertTrue(np.all((probabilities >= 0.0) & (probabilities <= 1.0)))
+        finally:
+            builtins.__import__ = original
+
 class TestDecisionPolicy(unittest.TestCase):
     def test_entity_policy_uses_group_margin(self):
         policy = choose_hysteresis_policy(
@@ -557,6 +588,122 @@ class TestDecisionPolicy(unittest.TestCase):
         selected = apply_entity_policy(candidates, policy)
         self.assertIn("S2-1", selected)
         self.assertNotIn("S2-2", selected)
+
+class TestSemanticFailureSafety(unittest.TestCase):
+    def test_model_load_failure_degrades_to_lexical_only(self):
+        import sys
+        import types
+
+        class FailingEncoder:
+            def __init__(self, *args, **kwargs):
+                raise OSError("offline/no cached weights")
+
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = FailingEncoder
+        sys.modules["sentence_transformers"] = fake_st
+        try:
+            from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+            retriever = SemanticRetriever(
+                SemanticConfig(
+                    enabled=True,
+                    allow_fallback=True,
+                    allow_download=False,
+                    encode_batch_size=2,
+                )
+            )
+            retriever.build([("T1", "business name: alpha")])
+            self.assertFalse(retriever.using_real_backend)
+            self.assertEqual(retriever.backend, "disabled_fallback")
+            self.assertEqual(retriever.query([("S1", "business name: alpha")]), [])
+        finally:
+            sys.modules.pop("sentence_transformers", None)
+
+    def test_old_sentence_transformers_api_never_retries_without_local_only(self):
+        import sys
+        import types
+
+        calls = []
+
+        class LegacyEncoder:
+            def __init__(self, *args, **kwargs):
+                calls.append(dict(kwargs))
+                if "local_files_only" in kwargs:
+                    raise TypeError("unexpected keyword argument 'local_files_only'")
+                raise AssertionError("network-capable retry must never occur when downloads are disabled")
+
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = LegacyEncoder
+        sys.modules["sentence_transformers"] = fake_st
+        try:
+            from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+            retriever = SemanticRetriever(
+                SemanticConfig(enabled=True, allow_fallback=True, allow_download=False)
+            )
+            retriever.build([("T1", "business name: alpha")])
+            self.assertEqual(retriever.backend, "disabled_fallback")
+            self.assertEqual(len(calls), 1)
+            self.assertIn("local_files_only", calls[0])
+            self.assertEqual(retriever.query([("S1", "business name: alpha")]), [])
+        finally:
+            sys.modules.pop("sentence_transformers", None)
+
+    def test_reranker_load_failure_does_not_crash(self):
+        import sys
+        import types
+
+        class FakeEncoder:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self, texts, **kwargs):
+                return np.ones((len(texts), 4), dtype=np.float32)
+
+        class FakeIndex:
+            def __init__(self, dimension, m, metric):
+                self.vectors = np.empty((0, dimension), dtype=np.float32)
+                self.hnsw = types.SimpleNamespace(efConstruction=0, efSearch=0)
+
+            def add(self, values):
+                self.vectors = np.vstack([self.vectors, values])
+
+            def search(self, queries, k):
+                scores = queries @ self.vectors.T
+                idx = np.tile(np.arange(min(k, self.vectors.shape[0])), (len(queries), 1))
+                dist = np.take_along_axis(scores, idx, axis=1)
+                return dist, idx
+
+        class FailingCrossEncoder:
+            def __init__(self, *args, **kwargs):
+                raise OSError("offline/no cached reranker")
+
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = FakeEncoder
+        fake_st.CrossEncoder = FailingCrossEncoder
+        fake_faiss = types.ModuleType("faiss")
+        fake_faiss.METRIC_INNER_PRODUCT = 0
+        fake_faiss.IndexHNSWFlat = FakeIndex
+        sys.modules["sentence_transformers"] = fake_st
+        sys.modules["faiss"] = fake_faiss
+        try:
+            from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+            retriever = SemanticRetriever(
+                SemanticConfig(
+                    enabled=True,
+                    allow_fallback=True,
+                    allow_download=False,
+                    rerank_top_k=1,
+                )
+            )
+            retriever.build([("T1", "business name: alpha")])
+            scores = retriever.rerank([("query", "document", 1)])
+            self.assertTrue(np.allclose(scores, 0.0))
+        finally:
+            sys.modules.pop("sentence_transformers", None)
+            sys.modules.pop("faiss", None)
+
 
 class TestDeterminism(unittest.TestCase):
     """Reproducibility."""
@@ -614,7 +761,7 @@ def test_semantic_retriever_real_backend_contract_with_stubs(monkeypatch):
     import types
 
     class FakeEncoder:
-        def __init__(self, model_name, device=None):
+        def __init__(self, model_name, device=None, local_files_only=None):
             self.model_name = model_name
 
         def encode(self, texts, **kwargs):
@@ -626,7 +773,7 @@ def test_semantic_retriever_real_backend_contract_with_stubs(monkeypatch):
             return np.asarray(vectors, dtype=np.float32)
 
     class FakeCrossEncoder:
-        def __init__(self, model_name, activation_fn=None, device=None):
+        def __init__(self, model_name, activation_fn=None, device=None, local_files_only=None):
             self.model_name = model_name
 
         def predict(self, pairs, **kwargs):
