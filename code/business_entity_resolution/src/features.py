@@ -9,6 +9,7 @@ from scipy import sparse as sp
 from sklearn.feature_extraction.text import HashingVectorizer
 
 from .preprocessing import extract_acronym, extract_address_numbers, extract_postal_code, normalize_address, normalize_name
+from .variation import VariationModel
 
 FEATURE_NAMES = [
     # Exact (4)
@@ -45,6 +46,13 @@ FEATURE_NAMES = [
     "name_rank_score", "address_rank_score", "name_address_rank_agreement",
     "reverse_similarity_rank_score", "mutual_best", "source2_indicator",
     "source3_indicator",
+    # Target-set relational evidence
+    "opposite_source_bridge",
+    "same_source_competition",
+    "bridge_gap",
+    # Training-derived lexical variation (zero-valued during untuned baseline).
+    "learned_name_alias", "learned_name_explained",
+    "learned_address_alias", "learned_address_explained",
 ]
 
 _CHAR_TRIGRAMS = HashingVectorizer(
@@ -148,9 +156,61 @@ def _acronym_matches(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     return matches
 
 
+def _set_jaccard(a: str, b: str) -> float:
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta and not tb:
+        return 1.0
+    union = ta | tb
+    return len(ta & tb) / len(union) if union else 0.0
+
+
+def _group_relational_scores(
+    source_ids: Sequence[str],
+    target_ids: Sequence[str],
+    target_cores: Sequence[str],
+    target_addresses: Sequence[str],
+    retrieval_scores: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cheap cross-source corroboration inside each S1 candidate set.
+
+    We inspect at most three strong opposite-source and same-source anchors per
+    candidate. This provides multi-source consistency without another fuzzy pass.
+    """
+    n = len(source_ids)
+    opposite = np.zeros(n, dtype=np.float32)
+    competition = np.zeros(n, dtype=np.float32)
+    groups: dict[str, list[int]] = {}
+    for i, sid in enumerate(source_ids):
+        groups.setdefault(sid, []).append(i)
+
+    for indices in groups.values():
+        ranked = sorted(indices, key=lambda i: (-float(retrieval_scores[i]), target_ids[i]))
+        s2 = [i for i in ranked if target_ids[i].startswith("S2-")]
+        s3 = [i for i in ranked if target_ids[i].startswith("S3-")]
+        buckets = {"S2": s2, "S3": s3}
+        for i in indices:
+            source = "S3" if target_ids[i].startswith("S3-") else "S2"
+            opposite_pool = buckets["S2" if source == "S3" else "S3"][:3]
+            same_pool = [j for j in buckets[source][:4] if j != i][:3]
+            if opposite_pool:
+                opposite[i] = max(
+                    0.60 * _set_jaccard(target_cores[i], target_cores[j])
+                    + 0.40 * _set_jaccard(target_addresses[i], target_addresses[j])
+                    for j in opposite_pool
+                )
+            if same_pool:
+                competition[i] = max(
+                    0.60 * _set_jaccard(target_cores[i], target_cores[j])
+                    + 0.40 * _set_jaccard(target_addresses[i], target_addresses[j])
+                    for j in same_pool
+                )
+
+    return opposite, competition, opposite - competition
+
+
 def _safe_optional_columns(columns: list[tuple], n: int) -> tuple[list[str], ...]:
     """Read advanced columns while preserving compatibility with old test rows."""
-    if len(columns) >= 29:
+    if len(columns) >= 30:
         s_num = columns[17]
         s_street = columns[18]
         s_city = columns[19]
@@ -183,7 +243,7 @@ def _safe_optional_columns(columns: list[tuple], n: int) -> tuple[list[str], ...
     )
 
 
-def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
+def feature_batch(rows: Sequence[tuple], variation_model: VariationModel | None = None) -> np.ndarray:
     """Vectorize a batch of candidate rows.
 
     ``rows`` may be the legacy 17-column candidate representation used by older
@@ -241,6 +301,16 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     name_rank_score = 1.0 / np.maximum(np.asarray(name_rank, dtype=np.float32), 1.0)
     address_rank_score = 1.0 / np.maximum(np.asarray(address_rank, dtype=np.float32), 1.0)
     reverse_rank_score = 1.0 / np.maximum(np.asarray(reverse_rank, dtype=np.float32), 1.0)
+    opposite_bridge, same_source_competition, bridge_gap = _group_relational_scores(
+        columns[0], columns[1], t_core, t_address, similarity
+    )
+
+    if variation_model is None:
+        learned_variation = np.zeros((len(rows), 4), dtype=np.float32)
+    else:
+        learned_variation = variation_model.score_batch(
+            s_core, t_core, s_address, t_address
+        )
 
     return np.column_stack((
         # Exact
@@ -293,4 +363,9 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
         np.asarray(mutual_best, dtype=np.float32),
         np.asarray([float(tid.startswith("S2-")) for tid in columns[1]], dtype=np.float32),
         np.asarray([float(tid.startswith("S3-")) for tid in columns[1]], dtype=np.float32),
+        opposite_bridge,
+        same_source_competition,
+        bridge_gap,
+        learned_variation[:, 0], learned_variation[:, 1],
+        learned_variation[:, 2], learned_variation[:, 3],
     )).astype(np.float32, copy=False)

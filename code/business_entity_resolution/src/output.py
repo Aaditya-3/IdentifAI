@@ -5,7 +5,7 @@ import csv
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence, Set, Tuple
+from typing import Callable, Iterable, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 from .data import Record
@@ -97,6 +97,9 @@ def write_submission_from_store_streaming(
     output_dir: Path,
     threshold: float,
     batch_size: int = 25_000,
+    threshold_by_country: Mapping[str, float] | None = None,
+    unseen_country_threshold: float | None = None,
+    variation_model=None,
 ) -> tuple[Path, Path]:
     """Run test inference and write both submission files with bounded memory.
 
@@ -108,9 +111,10 @@ def write_submission_from_store_streaming(
     candidate_path = output_dir / "candidate_pairs.tsv"
     matching_path = output_dir / "matching_results.tsv"
 
-    s1_cursor = iter(store.connection.execute("SELECT entity_id FROM source1 ORDER BY entity_id"))
+    s1_cursor = iter(store.connection.execute("SELECT entity_id, country FROM source1 ORDER BY entity_id"))
     current = next(s1_cursor, None)
     current_sid = current[0] if current else None
+    current_country = (current[1] or "").casefold() if current else ""
     previous_sid = None
     current_candidates: list[str] = []
     current_matches: list[str] = []
@@ -130,12 +134,13 @@ def write_submission_from_store_streaming(
         current_seen = set()
 
     def advance_to(fc, fm, sid: str) -> None:
-        nonlocal current_sid, previous_sid
+        nonlocal current_sid, current_country, previous_sid
         while current_sid is not None and current_sid < sid:
             write_current(fc, fm)
             previous_sid = current_sid
             current = next(s1_cursor, None)
             current_sid = current[0] if current else None
+            current_country = (current[1] or "").casefold() if current else ""
         if current_sid != sid:
             raise AssertionError(f"Candidate stream contains unknown/unordered Source-1 ID: {sid}")
 
@@ -155,7 +160,9 @@ def write_submission_from_store_streaming(
             if not batch:
                 break
 
-            probs = model.predict_proba(feature_batch([row[:-1] for row in batch]))
+            probs = model.predict_proba(
+                feature_batch([row[:-1] for row in batch], variation_model=variation_model)
+            )
             if len(probs) != len(batch):
                 raise AssertionError("Model probability count does not match feature batch size")
 
@@ -168,7 +175,15 @@ def write_submission_from_store_streaming(
                     raise AssertionError(f"Invalid target Source-1 ID {tid}")
                 current_seen.add(tid)
                 current_candidates.append(tid)
-                if float(prob) >= threshold:
+                active_threshold = float(threshold)
+                if threshold_by_country is not None:
+                    active_threshold = float(
+                        threshold_by_country.get(
+                            current_country,
+                            unseen_country_threshold if unseen_country_threshold is not None else threshold,
+                        )
+                    )
+                if float(prob) >= active_threshold:
                     current_matches.append(tid)
                 consumed_pairs += 1
 

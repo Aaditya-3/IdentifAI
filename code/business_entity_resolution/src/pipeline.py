@@ -21,7 +21,8 @@ import numpy as np
 
 from .blocking import BlockingStore
 from .features import FEATURE_NAMES, feature_batch
-from .model import PairModel
+from .model import LinearPairModel, PairModel, ProbabilityEnsemble
+from .variation import VariationModel
 from .output import (
     validate_output_against_store,
     write_submission_from_store_streaming,
@@ -31,7 +32,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = BlockingStore.TOP_K
 BASELINE_THRESHOLD = 0.5
-CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v8-baseline"
+CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v10-relation-aware"
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,7 @@ def _store_signature(data_dir: str | Path, split: str, top_k: int, with_truth: b
         },
         "cache_schema_version": CACHE_SCHEMA_VERSION,
         "code_signatures": _module_signature(
-            "blocking.py", "preprocessing.py", "features.py", "model.py", "pipeline.py"
+            "blocking.py", "preprocessing.py", "features.py", "variation.py", "model.py", "pipeline.py"
         ),
     }
 
@@ -204,6 +205,7 @@ def _materialize(
     parameters: Sequence[object] = (),
     labels: bool = True,
     subsample: bool = False,
+    variation_model: VariationModel | None = None,
 ) -> MatrixFiles:
     if labels and subsample:
         cond = (
@@ -241,7 +243,9 @@ def _materialize(
                 pass
             if not batch:
                 break
-            x[written : written + len(batch)] = feature_batch([row[:-1] for row in batch])
+            x[written : written + len(batch)] = feature_batch(
+                [row[:-1] for row in batch], variation_model=variation_model
+            )
             if y is not None:
                 y[written : written + len(batch)] = [row[-1] for row in batch]
             pair_file.writelines(f"{row[0]}\t{row[1]}\n" for row in batch)
@@ -396,6 +400,25 @@ def _write_measured_documentation(report: dict) -> Path:
     text = f"""# Business Entity Resolution Challenge — Methodology and Measured Baseline\n\n## Objective\n\nThe pipeline resolves each Source-1 record to zero, one, or many Source-2/Source-3 records using only the supplied challenge data. The competition metric is macro F0.5 per Source-1 entity.\n\n## Preprocessing and blocking\n\nNames are Unicode-normalized, case-folded and legal-suffix canonicalized. Addresses are normalized with deterministic street/address aliases and conservative structured components. Blocking uses exact/near-exact keys, rare tokens, phonetic keys, address numbers/postal codes, and MinHash-LSH. Keys above the frequency ceiling are not truncated by arbitrary ID order.\n\nThe final candidate set is adaptive with a hard TOP_K ceiling and is exactly the set passed to the matching model.\n\n## Features\n\nThe baseline uses {report.get('feature_count', 0)} pair features covering exact/fuzzy name and address similarity, token similarity, acronym/legal-suffix signals, address components, country consistency, missingness, retrieval evidence, cross-field rank agreement, and reciprocal candidate rank.\n\n## Baseline model\n\nThe first required real-data run is intentionally untuned: unweighted LightGBM and a fixed decision threshold of 0.5. No class-weight ablation, ensemble, hysteresis tuning or pseudo-labeling is applied before this baseline report exists.\n\n## Measured real-data baseline\n\n- Overall final candidate pairs: **{report.get('candidate_pairs', 0):,}**\n- Average final candidates/S1: **{report.get('average_candidates_per_s1', 0.0):.2f}**\n- Raw pair recall: **{raw.get('recall', 0.0):.6f}**\n- Raw complete-match-set recall: **{raw.get('complete_match_set_recall', 0.0):.6f}**\n- Final pair recall: **{final.get('recall', 0.0):.6f}**\n- Final complete-match-set recall: **{final.get('complete_match_set_recall', 0.0):.6f}**\n- Final p95 candidates/S1: **{stats.get('p95', 0)}**\n- Final p99 candidates/S1: **{stats.get('p99', 0)}**\n- Runtime: **{report.get('runtime_seconds', 0.0):.1f} seconds**\n\n### Validation views\n\n| View | Macro F0.5 | Precision | Recall |\n|---|---:|---:|---:|\n| Country holdout | {report.get('country_holdout', {}).get('macro_f0_5', 0.0):.6f} | {report.get('country_holdout', {}).get('precision', 0.0):.6f} | {report.get('country_holdout', {}).get('recall', 0.0):.6f} |\n| Reverse country | {report.get('reverse_country_holdout', {}).get('macro_f0_5', 0.0):.6f} | {report.get('reverse_country_holdout', {}).get('precision', 0.0):.6f} | {report.get('reverse_country_holdout', {}).get('recall', 0.0):.6f} |\n| In-distribution | {report.get('in_distribution', {}).get('macro_f0_5', 0.0):.6f} | {report.get('in_distribution', {}).get('precision', 0.0):.6f} | {report.get('in_distribution', {}).get('recall', 0.0):.6f} |\n\n### Candidate diagnostics by Source-1 country\n\n| Country | Pair recall | Complete-set recall | Avg candidates/S1 | Candidate pairs |\n|---|---:|---:|---:|---:|\n{country_table}\n\n## Next stage\n\nThis completed real baseline is the evidence gate for subsequent tuning. Any new threshold, model weighting, ensemble, decision rule or pseudo-labeling strategy must be compared against these real held-out numbers before being retained.\n\n## Fair play\n\nNo external entity databases, APIs, geocoders, registries or web enrichment are used.\n"""
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _build_variation_model(
+    store: BlockingStore,
+    where: str = "1=1",
+    parameters: Sequence[object] = (),
+    max_positive_pairs: int | None = None,
+) -> VariationModel:
+    """Build training-derived variation maps from a leakage-safe truth slice."""
+    t0 = time.perf_counter()
+    model = VariationModel.from_store(
+        store, where=where, parameters=parameters, max_positive_pairs=max_positive_pairs
+    )
+    LOGGER.info(
+        "Built variation model from %d positive pairs in %.1fs",
+        model.positive_pairs,
+        time.perf_counter() - t0,
+    )
+    return model
 
 
 def _validate_policy_path(scratch: Path) -> Path:
@@ -556,6 +579,26 @@ def validate(
         store.close()
 
 
+def _production_model_from_policy(policy: dict, seed: int, X: np.ndarray, y: np.ndarray):
+    spec = policy.get("selected_model_spec") or {}
+    kind = str(spec.get("kind", "lgbm"))
+    class_weight = spec.get("class_weight")
+    scale_pos_weight = spec.get("scale_pos_weight")
+    if kind == "ensemble":
+        primary = PairModel(
+            seed,
+            class_weight=class_weight,
+            scale_pos_weight=float(scale_pos_weight) if scale_pos_weight is not None else None,
+        ).fit(X, y)
+        secondary = LinearPairModel(seed, class_weight=class_weight).fit(X, y)
+        return ProbabilityEnsemble(primary, secondary, primary_weight=float(spec.get("ensemble_weight", 0.75)))
+    return PairModel(
+        seed,
+        class_weight=class_weight,
+        scale_pos_weight=float(scale_pos_weight) if scale_pos_weight is not None else None,
+    ).fit(X, y)
+
+
 def predict(
     test_dir: str | Path,
     output_dir: str | Path,
@@ -564,12 +607,29 @@ def predict(
     seed: int = 42,
     scratch_dir: str | Path = "scratch",
 ) -> float:
-    """Train on all training data and write both required submission files."""
+    """Train on all training data and write both required submission files.
+
+    Prediction uses the tuned policy when ``tuned_policy.json`` exists; otherwise
+    it falls back to the measured baseline policy.  No prediction is permitted
+    before a completed real validation baseline exists.
+    """
     scratch = Path(scratch_dir)
     scratch.mkdir(parents=True, exist_ok=True)
-    policy_path = _validate_policy_path(scratch)
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    threshold = float(policy.get("default_threshold", BASELINE_THRESHOLD))
+    baseline_policy_path = _validate_policy_path(scratch)
+    baseline_policy = json.loads(baseline_policy_path.read_text(encoding="utf-8"))
+    tuned_policy_path = scratch / "tuned_policy.json"
+    policy = json.loads(tuned_policy_path.read_text(encoding="utf-8")) if tuned_policy_path.exists() else baseline_policy
+
+    default_threshold = float(
+        policy.get("id_threshold", policy.get("default_threshold", BASELINE_THRESHOLD))
+    )
+    threshold_by_country = {
+        str(country).casefold(): float(value)
+        for country, value in (policy.get("thresholds") or policy.get("country_thresholds") or {}).items()
+    }
+    unseen_threshold = float(
+        policy.get("unseen_country_threshold", policy.get("zero_shot_fallback_threshold", default_threshold))
+    )
 
     train_store = _build_store(
         train_dir,
@@ -578,9 +638,23 @@ def predict(
         top_k,
         with_truth=True,
     )
+    variation_model = None
     try:
-        full = _materialize(train_store, scratch, "baseline_full_train", labels=True, subsample=True)
-        final_model = PairModel(seed).fit(full.x(), full.y())
+        spec = policy.get("selected_model_spec") or {}
+        if bool(spec.get("use_variation", False)):
+            variation_model = _build_variation_model(train_store, "1=1", (), None)
+        full = _materialize(
+            train_store,
+            scratch,
+            "production_full_train_var" if variation_model is not None else "production_full_train",
+            labels=True,
+            subsample=True,
+            variation_model=variation_model,
+        )
+        labels = full.y()
+        if labels is None:
+            raise RuntimeError("Production training matrix has no labels")
+        final_model = _production_model_from_policy(policy, seed, full.x(), labels)
     finally:
         train_store.close()
 
@@ -596,7 +670,10 @@ def predict(
             store=test_store,
             model=final_model,
             output_dir=Path(output_dir),
-            threshold=threshold,
+            threshold=default_threshold,
+            threshold_by_country=threshold_by_country or None,
+            unseen_country_threshold=unseen_threshold,
+            variation_model=variation_model,
         )
         validate_output_against_store(
             store=test_store,
@@ -606,4 +683,4 @@ def predict(
     finally:
         test_store.close()
 
-    return threshold
+    return default_threshold
