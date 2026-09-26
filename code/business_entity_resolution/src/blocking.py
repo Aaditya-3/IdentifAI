@@ -19,7 +19,10 @@ import zlib
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
-import jellyfish
+try:
+    import jellyfish
+except ImportError:  # lightweight offline fallback for soundex only
+    jellyfish = None
 import numpy as np
 from rapidfuzz import fuzz, process
 
@@ -35,13 +38,15 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BlockingStore:
-    TOP_K = 30
+    TOP_K = 64
     MINHASH_PERMUTATIONS = 32
     MINHASH_BANDS = 16  # r=2 rows/band -> 99.0% recall on 0.5 Jaccard overlap
     TOKEN_DF_LIMIT = 5_000
     # Frequency-aware key filtering thresholds (replace old KEY_CAP=160)
     KEY_FREQ_MAX_SOURCE = 2_000   # Source-side: drop keys with >N entries (not selective)
     KEY_FREQ_MAX_TARGET = 2_000   # Target-side: same
+    HIGH_FREQ_RESCUE_TOP = 64
+    HIGH_FREQ_RESCUE_MAX_BLOCK = 5_000
 
     _MINHASH_PRIME = np.uint64(4294967291)
     _MINHASH_A = np.asarray([2746317214, 478163328, 107420370, 3184935164, 1181241944, 1051802513, 958682847, 599310826, 3163119786, 440213416, 2906402158, 3181143732, 3831882065, 2342331445, 373399427, 2536146026, 1812140442, 136505588, 127978095, 402418011, 939042956, 999270937, 2170484434, 2585650757, 113971124, 2410529191, 854001194, 3075280818, 2791232394, 3012167821, 2340505847, 1801823909], dtype=np.uint64)
@@ -68,11 +73,17 @@ class BlockingStore:
             DROP TABLE IF EXISTS targets;
             DROP TABLE IF EXISTS token_df;
             DROP TABLE IF EXISTS block_keys;
+            DROP TABLE IF EXISTS bounded_keys;
+            DROP TABLE IF EXISTS high_freq_source_keys;
+            DROP TABLE IF EXISTS high_freq_target_keys;
+            DROP TABLE IF EXISTS all_target_keys;
+            DROP TABLE IF EXISTS bounded_target_keys;
             DROP TABLE IF EXISTS raw_candidates;
             DROP TABLE IF EXISTS shortlist;
             DROP TABLE IF EXISTS scored_candidates;
             DROP TABLE IF EXISTS final_candidates;
             DROP TABLE IF EXISTS truth;
+            DROP TABLE IF EXISTS pipeline_meta;
         """)
         self.connection.executescript("""
             CREATE TABLE source1 (
@@ -135,10 +146,28 @@ class BlockingStore:
 
     @staticmethod
     def _soundex(token: str) -> str:
-        try:
-            return jellyfish.soundex(token)
-        except (TypeError, ValueError):
+        token = (token or "").strip().upper()
+        if not token:
             return ""
+        if jellyfish is not None:
+            try:
+                return jellyfish.soundex(token)
+            except (TypeError, ValueError):
+                pass
+        # Deterministic pure-Python fallback matching standard American Soundex shape.
+        codes = {**{c: "1" for c in "BFPV"}, **{c: "2" for c in "CGJKQSXZ"},
+                 **{c: "3" for c in "DT"}, "L": "4", **{c: "5" for c in "MN"}, "R": "6"}
+        first = token[0]
+        prev = codes.get(first, "")
+        out: list[str] = []
+        for char in token[1:]:
+            code = codes.get(char, "")
+            if code and code != prev:
+                out.append(code)
+            prev = code
+            if len(out) == 3:
+                break
+        return (first + "".join(out) + "000")[:4]
 
     def _keys(self, country: str, name: str, core: str, sorted_core: str, address: str,
               numbers: str, rare_tokens: Iterable[str] = ()) -> list[tuple[str, float]]:
@@ -161,7 +190,10 @@ class BlockingStore:
             keys.append((f"number:{number}", weight))
 
         keys.extend((f"token:{token}", 6.0) for token in rare_tokens)
-        keys.extend((f"phonetic:{self._soundex(token)}", 2.5) for token in rare_tokens if self._soundex(token))
+        for token in rare_tokens:
+            sx = self._soundex(token)
+            if sx:
+                keys.append((f"phonetic:{sx}", 2.5))
         keys.extend((key, 2.0) for key in self._lsh_keys(core))
         keys.extend((key, 1.0) for key in self._lsh_keys(address, prefix="addr_lsh"))
         return [key for key in keys if key is not None]
@@ -241,30 +273,34 @@ class BlockingStore:
 
         This ensures NO entity is silently lost due to its ID sorting position.
         """
-        # Count entries per key
-        self.connection.execute("CREATE INDEX IF NOT EXISTS tmp_bk_eid ON block_keys(entity_id)")
+        # Preserve oversized source blocks separately. They are not used as an
+        # unrestricted Cartesian join; they are handled later by bounded,
+        # relevance-aware rescue retrieval.
+        self.connection.execute("""
+            CREATE TABLE high_freq_source_keys AS
+            SELECT bk.key, bk.entity_id, bk.weight
+            FROM block_keys bk
+            JOIN (SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key) kc
+              ON kc.key = bk.key
+            WHERE kc.cnt > ?
+        """, (self.KEY_FREQ_MAX_SOURCE,))
 
-        # Create filtered table: keep only keys with reasonable frequency
         self.connection.execute("""
             CREATE TABLE bounded_keys AS
             SELECT bk.key, bk.entity_id, bk.weight
             FROM block_keys bk
-            JOIN (
-                SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key
-            ) kc ON kc.key = bk.key
+            JOIN (SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key) kc
+              ON kc.key = bk.key
             WHERE kc.cnt <= ?
         """, (self.KEY_FREQ_MAX_SOURCE,))
 
-        dropped = self.connection.execute("""
-            SELECT COUNT(DISTINCT key) FROM (
-                SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key
-            ) WHERE cnt > ?
-        """, (self.KEY_FREQ_MAX_SOURCE,)).fetchone()[0]
+        dropped = self.connection.execute("SELECT COUNT(DISTINCT key) FROM high_freq_source_keys").fetchone()[0]
         kept = self.connection.execute("SELECT COUNT(DISTINCT key) FROM bounded_keys").fetchone()[0]
-        LOGGER.info("Source key filtering: kept %d keys, dropped %d non-selective keys (freq > %d)",
-                     kept, dropped, self.KEY_FREQ_MAX_SOURCE)
+        LOGGER.info("Source key filtering: kept %d selective keys; %d oversized keys routed to relevance-aware rescue",
+                     kept, dropped)
 
         self.connection.execute("CREATE INDEX bounded_keys_key ON bounded_keys(key)")
+        self.connection.execute("CREATE INDEX high_freq_source_key ON high_freq_source_keys(key, entity_id)")
         self.connection.execute("DROP TABLE block_keys")
         self.connection.commit()
 
@@ -285,6 +321,7 @@ class BlockingStore:
     def add_targets_and_retrieve(self, target_paths: Sequence[str | Path]) -> None:
         self.connection.execute("CREATE TABLE all_target_keys (target_id TEXT NOT NULL, key TEXT NOT NULL, weight REAL NOT NULL)")
         valid_keys = {row[0] for row in self.connection.execute("SELECT DISTINCT key FROM bounded_keys")}
+        valid_keys.update(row[0] for row in self.connection.execute("SELECT DISTINCT key FROM high_freq_source_keys"))
         for path in target_paths:
             target_rows, key_rows, count = [], [], 0
             for row in self._records(path):
@@ -308,24 +345,28 @@ class BlockingStore:
 
         self.connection.execute("CREATE INDEX atk_key ON all_target_keys(key)")
 
-        # Frequency-aware target key filtering: drop keys with too many targets
+        # Frequency-aware target key filtering for the normal bounded join.
+        # Oversized keys stay in all_target_keys and are handled by the rescue stage.
         self.connection.execute("""
             CREATE TABLE bounded_target_keys AS
             SELECT t.key, t.target_id, t.weight
             FROM all_target_keys t
-            JOIN (
-                SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key
-            ) kc ON kc.key = t.key
+            JOIN (SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key) kc
+              ON kc.key = t.key
             WHERE kc.cnt <= ?
         """, (self.KEY_FREQ_MAX_TARGET,))
 
-        dropped = self.connection.execute("""
-            SELECT COUNT(DISTINCT key) FROM (
-                SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key
-            ) WHERE cnt > ?
-        """, (self.KEY_FREQ_MAX_TARGET,)).fetchone()[0]
-        LOGGER.info("Target key filtering: dropped %d non-selective keys (freq > %d)",
-                     dropped, self.KEY_FREQ_MAX_TARGET)
+        self.connection.execute("""
+            CREATE TABLE high_freq_target_keys AS
+            SELECT t.key, t.target_id, t.weight
+            FROM all_target_keys t
+            JOIN (SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key) kc
+              ON kc.key = t.key
+            WHERE kc.cnt > ?
+        """, (self.KEY_FREQ_MAX_TARGET,))
+        self.connection.execute("CREATE INDEX high_freq_target_key ON high_freq_target_keys(key, target_id)")
+        dropped = self.connection.execute("SELECT COUNT(DISTINCT key) FROM high_freq_target_keys").fetchone()[0]
+        LOGGER.info("Target key filtering: %d oversized keys routed to relevance-aware rescue", dropped)
 
         self.connection.execute("CREATE INDEX btk_key ON bounded_target_keys(key)")
         self.connection.execute("""
@@ -335,9 +376,107 @@ class BlockingStore:
             GROUP BY b.entity_id, t.target_id
             ON CONFLICT(source1_id, target_id) DO UPDATE SET evidence=evidence + excluded.evidence
         """)
+        self._rescue_high_frequency_keys()
         self.connection.execute("DROP TABLE all_target_keys")
         self.connection.execute("DROP TABLE bounded_target_keys")
+        self.connection.execute("DROP TABLE high_freq_source_keys")
+        self.connection.execute("DROP TABLE high_freq_target_keys")
         self.connection.commit()
+
+    def _rescue_high_frequency_keys(self) -> None:
+        """Recover candidates from oversized blocks without an unrestricted Cartesian join.
+
+        For each oversized shared key, retrieve a bounded top set using cheap
+        name/address fuzzy similarity. This removes arbitrary ID-order truncation
+        while keeping worst-case candidate volume bounded by the rescue width.
+        """
+        keys = [row[0] for row in self.connection.execute(
+            "SELECT key FROM (SELECT DISTINCT key FROM high_freq_source_keys UNION SELECT DISTINCT key FROM high_freq_target_keys) ORDER BY key"
+        )]
+        if not keys:
+            return
+
+        rescued_pairs = 0
+        skipped_blocks = 0
+        for key in keys:
+            # Only rescue Source-1 entities that are not already saturated by
+            # selective candidates. This keeps high-frequency rescue bounded.
+            source_rows = self.connection.execute(
+                """SELECT s.entity_id, s.core, s.address
+                   FROM (
+                       SELECT entity_id FROM high_freq_source_keys WHERE key=?
+                       UNION
+                       SELECT entity_id FROM bounded_keys WHERE key=?
+                   ) h
+                   JOIN source1 s ON s.entity_id=h.entity_id
+                   LEFT JOIN (SELECT source1_id, COUNT(*) AS cnt FROM raw_candidates GROUP BY source1_id) rc
+                     ON rc.source1_id=s.entity_id
+                   WHERE COALESCE(rc.cnt, 0) < ?
+                   ORDER BY s.entity_id""", (key, key, self.top_k)
+            ).fetchall()
+            target_rows = self.connection.execute(
+                """SELECT t.entity_id, t.core, t.address
+                   FROM all_target_keys k
+                   JOIN targets t ON t.entity_id=k.target_id
+                   WHERE k.key=?
+                   GROUP BY t.entity_id
+                   ORDER BY t.entity_id""", (key,)
+            ).fetchall()
+
+            if not source_rows or not target_rows:
+                continue
+            if len(target_rows) > self.HIGH_FREQ_RESCUE_MAX_BLOCK:
+                skipped_blocks += 1
+                continue
+
+            target_ids = [r[0] for r in target_rows]
+            target_names = [r[1] for r in target_rows]
+            target_addresses = [r[2] for r in target_rows]
+            target_lookup = {r[0]: r for r in target_rows}
+
+            for sid, s_name, s_address in source_rows:
+                best: dict[str, float] = {}
+                if s_name:
+                    for _, score, idx in process.extract(
+                        s_name, target_names, scorer=fuzz.ratio, limit=self.HIGH_FREQ_RESCUE_TOP
+                    ):
+                        best[target_ids[idx]] = max(best.get(target_ids[idx], 0.0), 0.55 * float(score) / 100.0)
+                if s_address:
+                    for _, score, idx in process.extract(
+                        s_address, target_addresses, scorer=fuzz.ratio, limit=self.HIGH_FREQ_RESCUE_TOP
+                    ):
+                        best[target_ids[idx]] = max(best.get(target_ids[idx], 0.0), 0.45 * float(score) / 100.0)
+
+                # Re-score the union so a candidate strong on both modalities wins.
+                for tid in list(best):
+                    trow = target_lookup[tid]
+                    name_score = fuzz.ratio(s_name, trow[1]) / 100.0 if s_name and trow[1] else 0.0
+                    addr_score = fuzz.ratio(s_address, trow[2]) / 100.0 if s_address and trow[2] else 0.0
+                    if s_name and s_address:
+                        cheap = 0.55 * name_score + 0.45 * addr_score
+                    elif s_name:
+                        cheap = name_score
+                    else:
+                        cheap = addr_score
+                    best[tid] = cheap
+
+                rows = [
+                    (sid, tid, 1.0 + score)
+                    for tid, score in sorted(best.items(), key=lambda item: (-item[1], item[0]))
+                    if score >= 0.20
+                ][: self.HIGH_FREQ_RESCUE_TOP]
+                if rows:
+                    self.connection.executemany(
+                        """INSERT INTO raw_candidates(source1_id, target_id, evidence) VALUES (?, ?, ?)
+                           ON CONFLICT(source1_id, target_id) DO UPDATE SET evidence=MAX(raw_candidates.evidence, excluded.evidence)""",
+                        rows,
+                    )
+                    rescued_pairs += len(rows)
+
+        if skipped_blocks:
+            LOGGER.warning("Skipped %d oversized rescue blocks (> %d targets); selective/LSH blocks must cover those cases",
+                           skipped_blocks, self.HIGH_FREQ_RESCUE_MAX_BLOCK)
+        LOGGER.info("High-frequency rescue added %d bounded candidate rows", rescued_pairs)
 
     def finalize_candidates(self) -> int:
         diagnostics: dict = {}
@@ -505,7 +644,7 @@ class BlockingStore:
     def feature_count(self, where: str = "", parameters: Sequence[object] = ()) -> int:
         predicate = f"WHERE {where}" if where else ""
         return self.connection.execute(
-            f"SELECT COUNT(*) FROM final_candidates c JOIN source1 s ON s.entity_id=c.source1_id LEFT JOIN truth ON truth.source1_id=c.source1_id AND truth.target_id=c.target_id {predicate}", parameters
+            f"SELECT COUNT(*) FROM final_candidates c JOIN source1 s ON s.entity_id=c.source1_id JOIN targets t ON t.entity_id=c.target_id LEFT JOIN truth ON truth.source1_id=c.source1_id AND truth.target_id=c.target_id {predicate}", parameters
         ).fetchone()[0]
 
     def _has_truth(self) -> bool:

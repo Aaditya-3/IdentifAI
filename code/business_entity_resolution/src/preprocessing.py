@@ -52,6 +52,7 @@ _ADDRESS_ALIASES = {
 
 def _base(text: object) -> str:
     raw = str(text or "").casefold().replace("œ", "oe").replace("æ", "ae")
+    raw = raw.replace("&", " and ")
     value = unicodedata.normalize("NFKD", raw)
     chars = []
     previous_is_latin = False
