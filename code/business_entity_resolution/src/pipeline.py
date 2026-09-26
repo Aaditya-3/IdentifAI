@@ -21,7 +21,25 @@ from .output import write_submission_from_store_streaming, write_submission_stre
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_TOP_K = 64
+# Keep the production candidate cap aligned with BlockingStore.TOP_K.
+# 96 is the measured-recall optimization point to validate on the real block test.
+DEFAULT_TOP_K = 96
+CACHE_SCHEMA_VERSION = "2026-09-26-entity-resolution-v5-recall"
+
+
+def _module_signature(*names: str) -> dict[str, str]:
+    """Hash the code modules that affect candidate generation/features.
+
+    File size/mtime alone is insufficient for SQLite cache validity: a code
+    edit can leave both values unchanged in some sync/build environments.
+    """
+    result: dict[str, str] = {}
+    base = Path(__file__).resolve().parent
+    for name in names:
+        path = base / name
+        if path.exists():
+            result[name] = hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+    return result
 
 
 @dataclass(frozen=True)
@@ -82,7 +100,15 @@ def _store_signature(data_dir: str | Path, split: str, top_k: int, with_truth: b
             "token_df_limit": BlockingStore.TOKEN_DF_LIMIT,
             "key_freq_max_source": BlockingStore.KEY_FREQ_MAX_SOURCE,
             "key_freq_max_target": BlockingStore.KEY_FREQ_MAX_TARGET,
+            "high_freq_rescue_top": BlockingStore.HIGH_FREQ_RESCUE_TOP,
+            "high_freq_rescue_max_block": BlockingStore.HIGH_FREQ_RESCUE_MAX_BLOCK,
         },
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "code_signatures": _module_signature(
+            "blocking.py",
+            "preprocessing.py",
+            "features.py",
+        ),
     }
     return sig
 
@@ -317,6 +343,20 @@ def _fast_tune_threshold(
     return float(best_score), float(best_thresh)
 
 
+@dataclass
+class ModelSelection:
+    option: tuple[str, str | None, float | None]
+    country_score: float
+    country_threshold: float
+    id_score: float
+    id_threshold: float
+    results: dict
+    country_model: PairModel
+    country_probs: np.ndarray
+    id_model: PairModel
+    id_probs: np.ndarray
+
+
 def _model_options(labels: np.ndarray) -> list[tuple[str, str | None, float | None]]:
     positives = max(1, int(np.count_nonzero(labels)))
     imbalance = max(1.0, (len(labels) - positives) / positives)
@@ -328,153 +368,429 @@ def _model_options(labels: np.ndarray) -> list[tuple[str, str | None, float | No
     ]
 
 
-def _select_model(store: BlockingStore, fit: MatrixFiles, tune: MatrixFiles,
-                  in_fit: MatrixFiles, in_tune: MatrixFiles,
-                  where: str, parameters: Sequence[object], seed: int) -> tuple[tuple[str, str | None, float | None], float, float, dict]:
-    results = {}
-    best = None
-    best_score, best_threshold = -1.0, 0.95
+def _select_model(
+    store: BlockingStore,
+    fit: MatrixFiles,
+    tune: MatrixFiles,
+    in_fit: MatrixFiles,
+    in_tune: MatrixFiles,
+    where: str,
+    parameters: Sequence[object],
+    seed: int,
+) -> ModelSelection:
+    """Select model weights once and retain the winning validation artifacts.
+
+    Retaining the winning models/probabilities avoids refitting the same model
+    later just to report precision/recall or retune the in-distribution
+    threshold.
+    """
+    results: dict = {}
+    best_option = None
+    best_score = -1.0
+    best_country_threshold = 0.95
+    best_country_model: PairModel | None = None
+    best_country_probs: np.ndarray | None = None
+    best_id_model: PairModel | None = None
+    best_id_probs: np.ndarray | None = None
+    best_id_score = -1.0
+    best_id_threshold = 0.95
     baseline_id_score = None
 
-    for option in _model_options(fit.y()):  # type: ignore[arg-type]
-        name, class_weight, scale_pos_weight = option
-        model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(fit.x(), fit.y())
-        probs_tune = _batched_predict_proba(model, tune)
-        score, threshold = _fast_tune_threshold(store, tune, probs_tune, where, parameters)
+    fit_y = fit.y()
+    if fit_y is None:
+        raise ValueError("Training matrix is missing labels")
 
-        in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
-        probs_id = _batched_predict_proba(in_model, in_tune)
-        id_score, _ = _fast_tune_threshold(store, in_tune, probs_id, "s.split=0", ())
+    for option in _model_options(fit_y):
+        name, class_weight, scale_pos_weight = option
+
+        country_model = PairModel(
+            seed,
+            class_weight=class_weight,
+            scale_pos_weight=scale_pos_weight,
+        ).fit(fit.x(), fit_y)
+        probs_tune = _batched_predict_proba(country_model, tune)
+        country_score, country_threshold = _fast_tune_threshold(
+            store, tune, probs_tune, where, parameters
+        )
+
+        id_y = in_fit.y()
+        if id_y is None:
+            raise ValueError("In-distribution training matrix is missing labels")
+        id_model = PairModel(
+            seed,
+            class_weight=class_weight,
+            scale_pos_weight=scale_pos_weight,
+        ).fit(in_fit.x(), id_y)
+        probs_id = _batched_predict_proba(id_model, in_tune)
+        id_score, id_threshold = _fast_tune_threshold(
+            store, in_tune, probs_id, "s.split=0", ()
+        )
 
         if name == "unweighted":
             baseline_id_score = id_score
 
-        results[name] = {"macro_f0_5": score, "threshold": threshold, "id_macro_f0_5": id_score}
-        LOGGER.info("Model %s: country F0.5=%.6f (t=%.3f), ID F0.5=%.6f", name, score, threshold, id_score)
+        results[name] = {
+            "macro_f0_5": country_score,
+            "threshold": country_threshold,
+            "id_macro_f0_5": id_score,
+            "id_threshold": id_threshold,
+        }
 
-        if baseline_id_score is not None and id_score < baseline_id_score - 0.005:
-            LOGGER.info("Rejecting %s: ID score %.6f regressed from baseline %.6f", name, id_score, baseline_id_score)
+        LOGGER.info(
+            "Model %s: country F0.5=%.6f (t=%.3f), ID F0.5=%.6f (t=%.3f)",
+            name,
+            country_score,
+            country_threshold,
+            id_score,
+            id_threshold,
+        )
+
+        if (
+            baseline_id_score is not None
+            and id_score < baseline_id_score - 0.005
+        ):
+            LOGGER.info(
+                "Rejecting %s: ID score %.6f regressed from baseline %.6f",
+                name,
+                id_score,
+                baseline_id_score,
+            )
             continue
 
-        if score > best_score or (score == best_score and threshold > best_threshold):
-            best, best_score, best_threshold = option, score, threshold
+        is_better = (
+            country_score > best_score
+            or (
+                country_score == best_score
+                and country_threshold > best_country_threshold
+            )
+        )
+        if is_better:
+            best_option = option
+            best_score = float(country_score)
+            best_country_threshold = float(country_threshold)
+            best_id_score = float(id_score)
+            best_id_threshold = float(id_threshold)
+            best_country_model = country_model
+            best_country_probs = probs_tune
+            best_id_model = id_model
+            best_id_probs = probs_id
 
-    assert best is not None
-    return best, best_score, best_threshold, results
+    if (
+        best_option is None
+        or best_country_model is None
+        or best_country_probs is None
+        or best_id_model is None
+        or best_id_probs is None
+    ):
+        raise RuntimeError("No model option survived model selection")
 
+    return ModelSelection(
+        option=best_option,
+        country_score=best_score,
+        country_threshold=best_country_threshold,
+        id_score=best_id_score,
+        id_threshold=best_id_threshold,
+        results=results,
+        country_model=best_country_model,
+        country_probs=best_country_probs,
+        id_model=best_id_model,
+        id_probs=best_id_probs,
+    )
 
-def validate(data_dir: str | Path, top_k: int = DEFAULT_TOP_K, seed: int = 42, scratch_dir: str | Path = "scratch") -> tuple[float, float]:
+def validate(
+    data_dir: str | Path,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int = 42,
+    scratch_dir: str | Path = "scratch",
+) -> tuple[float, float]:
     t_total = time.perf_counter()
-    scratch = Path(scratch_dir); scratch.mkdir(parents=True, exist_ok=True)
-    store = _build_store(data_dir, "train", scratch / "train_validation.sqlite", top_k, with_truth=True)
-    train_country, validation_country = _countries(store)
+    scratch = Path(scratch_dir)
+    scratch.mkdir(parents=True, exist_ok=True)
 
-    fit = _materialize(store, scratch, "country_fit", "s.country=?", (train_country,), subsample=True)
-    valid = _materialize(store, scratch, "country_valid", "s.country=?", (validation_country,))
-    in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", (), subsample=True)
-    in_valid = _materialize(store, scratch, "id_valid", "s.split=0", ())
+    store = _build_store(
+        data_dir,
+        "train",
+        scratch / "train_validation.sqlite",
+        top_k,
+        with_truth=True,
+    )
+    try:
+        train_country, validation_country = _countries(store)
 
-    selected, country_score, country_threshold, weight_results = _select_model(
-        store, fit, valid, in_fit, in_valid, "s.country=?", (validation_country,), seed,
+        fit = _materialize(
+            store,
+            scratch,
+            "country_fit",
+            "s.country=?",
+            (train_country,),
+            subsample=True,
+        )
+        valid = _materialize(
+            store,
+            scratch,
+            "country_valid",
+            "s.country=?",
+            (validation_country,),
+        )
+        in_fit = _materialize(
+            store,
+            scratch,
+            "id_fit",
+            "s.split<>0",
+            (),
+            subsample=True,
+        )
+        in_valid = _materialize(
+            store,
+            scratch,
+            "id_valid",
+            "s.split=0",
+            (),
+        )
+
+        selection = _select_model(
+            store,
+            fit,
+            valid,
+            in_fit,
+            in_valid,
+            "s.country=?",
+            (validation_country,),
+            seed,
+        )
+
+        # Reverse-country validation is a robustness check. Keep its training
+        # side sampled so validation does not require another full candidate
+        # matrix/model fit on the opposite country.
+        rev_fit = _materialize(
+            store,
+            scratch,
+            "country_rev_fit",
+            "s.country=?",
+            (validation_country,),
+            subsample=True,
+        )
+        rev_valid = _materialize(
+            store,
+            scratch,
+            "country_rev_valid",
+            "s.country=?",
+            (train_country,),
+        )
+
+        _, rev_cw, rev_spw = selection.option
+        rev_model = PairModel(
+            seed,
+            class_weight=rev_cw,
+            scale_pos_weight=rev_spw,
+        ).fit(rev_fit.x(), rev_fit.y())
+        rev_probs = _batched_predict_proba(rev_model, rev_valid)
+        rev_score, rev_threshold = _fast_tune_threshold(
+            store,
+            rev_valid,
+            rev_probs,
+            "s.country=?",
+            (train_country,),
+        )
+
+        # Reuse the selected in-distribution model/probabilities instead of
+        # fitting the same model a second time just to compute the final ID
+        # diagnostics.
+        in_probs = selection.id_probs
+        in_score = selection.id_score
+        in_threshold = selection.id_threshold
+
+        def _precision_recall(
+            probs: np.ndarray,
+            matrix: MatrixFiles,
+            threshold: float,
+        ) -> tuple[float, float]:
+            labels = matrix.y()
+            if labels is None:
+                return 0.0, 0.0
+            labels_bool = np.asarray(labels, dtype=bool)
+            mask = probs >= threshold
+            tp = int(np.sum(mask & labels_bool))
+            fp = int(np.sum(mask & ~labels_bool))
+            fn = int(np.sum(~mask & labels_bool))
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            return precision, recall
+
+        country_prec, country_rec = _precision_recall(
+            selection.country_probs,
+            valid,
+            selection.country_threshold,
+        )
+        in_prec, in_rec = _precision_recall(
+            in_probs,
+            in_valid,
+            in_threshold,
+        )
+
+        candidate_total, candidate_avg = store.candidate_summary()
+        report = {
+            "country_holdout": {
+                "train_country": train_country,
+                "validation_country": validation_country,
+                "macro_f0_5": selection.country_score,
+                "threshold": selection.country_threshold,
+                "precision": country_prec,
+                "recall": country_rec,
+            },
+            "reverse_country_holdout": {
+                "train_country": validation_country,
+                "validation_country": train_country,
+                "macro_f0_5": rev_score,
+                "threshold": rev_threshold,
+            },
+            "in_distribution": {
+                "macro_f0_5": in_score,
+                "threshold": in_threshold,
+                "precision": in_prec,
+                "recall": in_rec,
+            },
+            "model_selection": {
+                "selected": selection.option[0],
+                "ablation": selection.results,
+            },
+            "blocking": {
+                "recall": store.recall_ceiling()[0],
+                "candidate_pairs": candidate_total,
+                "average_candidates": candidate_avg,
+                "diagnostics": store.diagnostics,
+            },
+            "runtime_seconds": time.perf_counter() - t_total,
+        }
+        (scratch / "validation_report.json").write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+
+        LOGGER.info(
+            "Validation complete: Country OOD F0.5=%.6f, ID F0.5=%.6f [%.1fs]",
+            selection.country_score,
+            in_score,
+            time.perf_counter() - t_total,
+        )
+        LOGGER.info(
+            "  Country: prec=%.4f rec=%.4f  |  ID: prec=%.4f rec=%.4f",
+            country_prec,
+            country_rec,
+            in_prec,
+            in_rec,
+        )
+
+        return selection.country_score, selection.country_threshold
+    finally:
+        store.close()
+
+def predict(
+    test_dir: str | Path,
+    output_dir: str | Path,
+    train_dir: str | Path,
+    top_k: int = DEFAULT_TOP_K,
+    seed: int = 42,
+    scratch_dir: str | Path = "scratch",
+) -> float:
+    scratch = Path(scratch_dir)
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    train_store = _build_store(
+        train_dir,
+        "train",
+        scratch / "train_predict.sqlite",
+        top_k,
+        with_truth=True,
     )
 
-    rev_fit = _materialize(store, scratch, "country_rev_fit", "s.country=?", (validation_country,))
-    rev_valid = _materialize(store, scratch, "country_rev_valid", "s.country=?", (train_country,))
-    _, rev_cw, rev_spw = selected
-    rev_model = PairModel(seed, class_weight=rev_cw, scale_pos_weight=rev_spw).fit(rev_fit.x(), rev_fit.y())
-    rev_probs = _batched_predict_proba(rev_model, rev_valid)
-    rev_score, rev_threshold = _fast_tune_threshold(store, rev_valid, rev_probs, "s.country=?", (train_country,))
+    try:
+        train_country, validation_country = _countries(train_store)
 
-    in_model = PairModel(seed, class_weight=rev_cw, scale_pos_weight=rev_spw).fit(in_fit.x(), in_fit.y())
-    in_probs = _batched_predict_proba(in_model, in_valid)
-    in_score, in_threshold = _fast_tune_threshold(store, in_valid, in_probs, "s.split=0", ())
+        fit = _materialize(
+            train_store,
+            scratch,
+            "threshold_fit",
+            "s.country=?",
+            (train_country,),
+            subsample=True,
+        )
+        tune = _materialize(
+            train_store,
+            scratch,
+            "threshold_tune",
+            "s.country=?",
+            (validation_country,),
+        )
+        in_fit = _materialize(
+            train_store,
+            scratch,
+            "predict_id_fit",
+            "s.split<>0",
+            (),
+            subsample=True,
+        )
+        in_tune = _materialize(
+            train_store,
+            scratch,
+            "predict_id_tune",
+            "s.split=0",
+            (),
+        )
 
-    # Compute precision/recall at optimal thresholds for detailed reporting
-    def _precision_recall(probs, matrix, threshold):
-        labels = matrix.y()
-        if labels is None:
-            return 0.0, 0.0
-        mask = probs >= threshold
-        tp = int(np.sum(mask & np.asarray(labels, dtype=bool)))
-        fp = int(np.sum(mask & ~np.asarray(labels, dtype=bool)))
-        fn = int(np.sum(~mask & np.asarray(labels, dtype=bool)))
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        return prec, rec
+        selection = _select_model(
+            train_store,
+            fit,
+            tune,
+            in_fit,
+            in_tune,
+            "s.country=?",
+            (validation_country,),
+            seed,
+        )
 
-    country_prec, country_rec = _precision_recall(
-        _batched_predict_proba(PairModel(seed, class_weight=rev_cw, scale_pos_weight=rev_spw).fit(fit.x(), fit.y()), valid),
-        valid, country_threshold
+        # Calibrate the production threshold from the retained winning
+        # model's grouped in-distribution validation predictions.
+        threshold = selection.id_threshold
+        LOGGER.info(
+            "Calibrated final threshold %.6f using S1-grouped validation (split=0)",
+            threshold,
+        )
+
+        full = _materialize(
+            train_store,
+            scratch,
+            "full_train",
+            labels=True,
+            subsample=True,
+        )
+
+        _, class_weight, scale_pos_weight = selection.option
+        final_model = PairModel(
+            seed,
+            class_weight=class_weight,
+            scale_pos_weight=scale_pos_weight,
+        ).fit(full.x(), full.y())
+    finally:
+        train_store.close()
+
+    test_store = _build_store(
+        test_dir,
+        "test",
+        scratch / "test_predict.sqlite",
+        top_k,
+        with_truth=False,
     )
-    in_prec, in_rec = _precision_recall(in_probs, in_valid, in_threshold)
+    try:
+        # Stream final candidate features -> model -> outputs. This keeps peak
+        # test-inference memory bounded by batch_size rather than all pairs.
+        write_submission_from_store_streaming(
+            store=test_store,
+            model=final_model,
+            output_dir=Path(output_dir),
+            threshold=threshold,
+        )
+    finally:
+        test_store.close()
 
-    report = {
-        "country_holdout": {
-            "train_country": train_country, "validation_country": validation_country,
-            "macro_f0_5": country_score, "threshold": country_threshold,
-            "precision": country_prec, "recall": country_rec,
-        },
-        "reverse_country_holdout": {
-            "train_country": validation_country, "validation_country": train_country,
-            "macro_f0_5": rev_score, "threshold": rev_threshold,
-        },
-        "in_distribution": {
-            "macro_f0_5": in_score, "threshold": in_threshold,
-            "precision": in_prec, "recall": in_rec,
-        },
-        "model_selection": {"selected": selected[0], "ablation": weight_results},
-        "blocking": {
-            "recall": store.recall_ceiling()[0],
-            "candidate_pairs": store.candidate_summary()[0],
-            "average_candidates": store.candidate_summary()[1],
-            "diagnostics": store.diagnostics,
-        },
-        "runtime_seconds": time.perf_counter() - t_total,
-    }
-    (scratch / "validation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    LOGGER.info("Validation complete: Country OOD F0.5=%.6f, ID F0.5=%.6f [%.1fs]",
-                country_score, in_score, time.perf_counter() - t_total)
-    LOGGER.info("  Country: prec=%.4f rec=%.4f  |  ID: prec=%.4f rec=%.4f",
-                country_prec, country_rec, in_prec, in_rec)
-    store.close()
-    return country_score, country_threshold
-
-
-def predict(test_dir: str | Path, output_dir: str | Path, train_dir: str | Path, top_k: int = DEFAULT_TOP_K, seed: int = 42, scratch_dir: str | Path = "scratch") -> float:
-    scratch = Path(scratch_dir); scratch.mkdir(parents=True, exist_ok=True)
-    train_store = _build_store(train_dir, "train", scratch / "train_predict.sqlite", top_k, with_truth=True)
-    train_country, validation_country = _countries(train_store)
-
-    fit = _materialize(train_store, scratch, "threshold_fit", "s.country=?", (train_country,), subsample=True)
-    tune = _materialize(train_store, scratch, "threshold_tune", "s.country=?", (validation_country,))
-    in_fit = _materialize(train_store, scratch, "predict_id_fit", "s.split<>0", (), subsample=True)
-    in_tune = _materialize(train_store, scratch, "predict_id_tune", "s.split=0", ())
-
-    selected, _, country_threshold, _ = _select_model(
-        train_store, fit, tune, in_fit, in_tune, "s.country=?", (validation_country,), seed,
-    )
-
-    _, class_weight, scale_pos_weight = selected
-    in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
-    in_probs = _batched_predict_proba(in_model, in_tune)
-    _, threshold = _fast_tune_threshold(train_store, in_tune, in_probs, "s.split=0", ())
-    
-    LOGGER.info("Calibrated final threshold %.3f using S1-grouped validation (split=0)", threshold)
-    
-    full = _materialize(train_store, scratch, "full_train", labels=True, subsample=True)
-    model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(full.x(), full.y())
-    train_store.close()
-
-    test_store = _build_store(test_dir, "test", scratch / "test_predict.sqlite", top_k, with_truth=False)
-
-    # Stream final candidate features -> model -> outputs. This avoids a gigantic
-    # test feature matrix and probability array that scale with |candidates|.
-    write_submission_from_store_streaming(
-        store=test_store,
-        model=model,
-        output_dir=Path(output_dir),
-        threshold=threshold,
-    )
-
-    test_store.close()
     return threshold

@@ -6,6 +6,7 @@ from typing import Mapping, Sequence
 import numpy as np
 from rapidfuzz import fuzz, process
 from sklearn.feature_extraction.text import HashingVectorizer
+from scipy import sparse as sp
 
 from .data import Record
 from .preprocessing import (
@@ -106,12 +107,21 @@ def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     l_mats, l_norms = _get(left)
     r_mats, r_norms = _get(right)
     
-    numerator = np.zeros(len(left), dtype=np.float32)
-    for i, (lm, rm) in enumerate(zip(l_mats, r_mats)):
-        numerator[i] = lm.multiply(rm).sum()
-        
+    # Stack sparse rows and compute all row-wise dot products in one
+    # sparse operation. This removes a Python loop over every pair.
+    left_matrix = sp.vstack(l_mats, format="csr")
+    right_matrix = sp.vstack(r_mats, format="csr")
+    numerator = np.asarray(
+        left_matrix.multiply(right_matrix).sum(axis=1)
+    ).ravel().astype(np.float32, copy=False)
+
     denom = l_norms * r_norms
-    return np.divide(numerator, denom, out=np.zeros(len(left), dtype=np.float32), where=denom > 0)
+    return np.divide(
+        numerator,
+        denom,
+        out=np.zeros(len(left), dtype=np.float32),
+        where=denom > 0,
+    )
 
 
 def _number_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
