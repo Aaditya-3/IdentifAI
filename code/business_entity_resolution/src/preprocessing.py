@@ -8,9 +8,8 @@ from typing import Iterable, Mapping
 _SPACE = re.compile(r"\s+")
 _PUNCT = re.compile(r"[^\w]+", flags=re.UNICODE)
 _NUMBER = re.compile(r"(?<!\w)\d+(?!\w)")
+_POSTAL = re.compile(r"(?<!\d)\d{5,6}(?!\d)")
 
-# Canonical forms retain the legal entity signal; core-name extraction removes
-# recognized legal endings so the business name can be compared independently.
 _LEGAL_SUFFIXES = {
     "corporation": "corp", "corp": "corp", "incorporated": "inc", "inc": "inc",
     "limited": "ltd", "ltd": "ltd", "private": "pvt", "pvt": "pvt",
@@ -52,13 +51,9 @@ _ADDRESS_ALIASES = {
 
 
 def _base(text: object) -> str:
-    value = unicodedata.normalize("NFKD", str(text or "").casefold())
+    raw = str(text or "").casefold().replace("œ", "oe").replace("æ", "ae")
+    value = unicodedata.normalize("NFKD", raw)
     chars = []
-    # NFKD turns Latin accents into an ASCII base letter followed by a combining
-    # mark.  Keep marks used by non-Latin scripts (notably Indic vowel signs),
-    # while dropping only marks following an ASCII Latin base.  The former
-    # implementation called ``unicodedata.name`` for every character, which is
-    # prohibitively slow when normalizing the multi-million-row data files.
     previous_is_latin = False
     for char in value:
         if unicodedata.combining(char):
@@ -73,23 +68,18 @@ def _base(text: object) -> str:
 
 
 def normalize_name(text: object) -> str:
-    """Normalize Unicode and standardize recognized legal suffixes."""
     value = _base(text)
-
     def canonicalize(match: re.Match[str]) -> str:
         token = match.group(1)
         return " " + _LEGAL_SUFFIXES.get(token.casefold(), token.casefold()) + " "
-
     return _SPACE.sub(" ", _LEGAL_PATTERN.sub(canonicalize, " " + value + " ")).strip()
 
 
 def core_name(text: object) -> str:
-    """Return the normalized business name without trailing legal suffixes."""
     return _LEGAL_TAIL.sub("", normalize_name(text)).strip()
 
 
 def normalize_address(text: object) -> str:
-    """Normalize accents, punctuation, whitespace, and common street types."""
     value = _base(text)
     return _SPACE.sub(" ", re.sub(
         r"\b[\w]+\b", lambda m: _ADDRESS_ALIASES.get(
@@ -99,12 +89,24 @@ def normalize_address(text: object) -> str:
 
 
 def extract_address_numbers(text: object) -> str:
-    """Return numeric address tokens in appearance order."""
     return " ".join(_NUMBER.findall(_base(text)))
 
 
+def extract_postal_code(text: object) -> str:
+    matches = _POSTAL.findall(_base(text))
+    return matches[0] if matches else ""
+
+
+def extract_acronym(text: object) -> str:
+    tokens = [t for t in str(text or "").split() if t not in {"and", "of", "the", "&", "de", "la", "et"}]
+    return "".join(t[0] for t in tokens if t) if len(tokens) >= 2 else ""
+
+
+def composite_text(record: Mapping[str, object]) -> str:
+    return f"{normalize_name(record.get('business_name', ''))} {normalize_address(record.get('business_address', ''))}".strip()
+
+
 def preprocess_record(record: Mapping[str, object]) -> dict:
-    """Copy a record and add derived fields without changing its raw text."""
     enriched = dict(record)
     raw_name = record.get("business_name", "")
     raw_address = record.get("business_address", "")
@@ -116,9 +118,4 @@ def preprocess_record(record: Mapping[str, object]) -> dict:
 
 
 def preprocess_records(records: Iterable[Mapping[str, object]]) -> list[dict]:
-    """Return records with derived columns while preserving all source values."""
     return [preprocess_record(record) for record in records]
-
-
-def composite_text(record: Mapping[str, object]) -> str:
-    return f"{normalize_name(record.get('business_name', ''))} {normalize_address(record.get('business_address', ''))}".strip()

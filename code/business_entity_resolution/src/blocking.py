@@ -1,4 +1,4 @@
-"""Disk-backed, bounded candidate retrieval for large entity-resolution data."""
+"""Disk-backed, high-recall bounded candidate retrieval for large entity-resolution data."""
 from __future__ import annotations
 
 import csv
@@ -12,53 +12,29 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 import jellyfish
 import numpy as np
+from rapidfuzz import fuzz, process
 
-from .preprocessing import core_name, extract_address_numbers, normalize_address, normalize_name
+from .preprocessing import (
+    core_name,
+    extract_acronym,
+    extract_address_numbers,
+    normalize_address,
+    normalize_name,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
 class BlockingStore:
-    """A reproducible on-disk inverted index and bounded candidate store.
-
-    SQLite is used as an embedded disk index: no source-target Cartesian product,
-    corpus-wide TF-IDF fit, or all-target in-memory index is created.  Every key
-    retains a deterministic bounded sample of its bucket instead of nulling an
-    overloaded signature, and other keys remain available for the same record.
-    """
-
     KEY_CAP = 160
     TOP_K = 30
     MINHASH_PERMUTATIONS = 32
-    MINHASH_BANDS = 8
+    MINHASH_BANDS = 16  # r = 2 rows/band -> 99.0% recall on 0.5 Jaccard overlap
     TOKEN_DF_LIMIT = 5_000
+    
     _MINHASH_PRIME = np.uint64(2_305_843_009_213_693_951)
-    _MINHASH_A = np.asarray([
-        175024136490432477, 1008461672852386719, 304050906325147733,
-        219375881232363861, 1192609536327377963, 134449713686080091,
-        715803879697798251, 2055673613667237879, 2238042901163330401,
-        987556459621084289, 1614146762471928973, 571695673060610799,
-        1121592436292092571, 1716141154001985503, 452456183571917821,
-        2019785756305873093, 1545412558405659237, 1080267597293584387,
-        772952590234537641, 1774101489297710499, 637527053171929559,
-        1400412172066132301, 386650502565740121, 1876880236773344987,
-        941958701131499973, 1224242964453961681, 203213846197551769,
-        1049488408464727727, 229688990350128819, 1460129560061248699,
-        509318116929722547, 1973024535596978649,
-    ], dtype=np.uint64)
-    _MINHASH_B = np.asarray([
-        90119446130723957, 592104492043502371, 1509280258895496711,
-        467556482198014509, 183728047809268817, 1270849163460746191,
-        394407868526144257, 1754983723644681889, 804355541601597777,
-        210411929209609711, 1022914920567892697, 1377703091700300033,
-        275388934354195033, 1966363016444041723, 830275129151219099,
-        1097683924686424117, 548557095446627023, 1582685027813246659,
-        658466264737671963, 126214514629763221, 1700410973577759927,
-        309525570113233513, 1169352436691760691, 451937827317298453,
-        1916317775890083869, 730380426196709007, 1352908105434264199,
-        258348877255819047, 214103520682410357, 940778968761157123,
-        1666261754332139261, 698453635253312941,
-    ], dtype=np.uint64)
+    _MINHASH_A = np.asarray([175024136490432477, 1008461672852386719, 304050906325147733, 219375881232363861, 1192609536327377963, 134449713686080091, 715803879697798251, 2055673613667237879, 2238042901163330401, 987556459621084289, 1614146762471928973, 571695673060610799, 1121592436292092571, 1716141154001985503, 452456183571917821, 2019785756305873093, 1545412558405659237, 1080267597293584387, 772952590234537641, 1774101489297710499, 637527053171929559, 1400412172066132301, 386650502565740121, 1876880236773344987, 941958701131499973, 1224242964453961681, 203213846197551769, 1049488408464727727, 229688990350128819, 1460129560061248699, 509318116929722547, 1973024535596978649], dtype=np.uint64)
+    _MINHASH_B = np.asarray([90119446130723957, 592104492043502371, 1509280258895496711, 467556482198014509, 183728047809268817, 1270849163460746191, 394407868526144257, 1754983723644681889, 804355541601597777, 210411929209609711, 1022914920567892697, 1377703091700300033, 275388934354195033, 1966363016444041723, 830275129151219099, 1097683924686424117, 548557095446627023, 1582685027813246659, 658466264737671963, 126214514629763221, 1700410973577759927, 309525570113233513, 1169352436691760691, 451937827317298453, 1916317775890083869, 730380426196709007, 1352908105434264199, 258348877255819047, 214103520682410357, 940778968761157123, 1666261754332139261, 698453635253312941], dtype=np.uint64)
 
     def __init__(self, database: str | Path, top_k: int = TOP_K, key_cap: int = KEY_CAP):
         self.path = Path(database)
@@ -86,6 +62,7 @@ class BlockingStore:
             DROP TABLE IF EXISTS target_keys;
             DROP TABLE IF EXISTS raw_candidates;
             DROP TABLE IF EXISTS shortlist;
+            DROP TABLE IF EXISTS scored_candidates;
             DROP TABLE IF EXISTS final_candidates;
             DROP TABLE IF EXISTS truth;
         """)
@@ -106,8 +83,10 @@ class BlockingStore:
                 source1_id TEXT NOT NULL, target_id TEXT NOT NULL, evidence REAL NOT NULL,
                 PRIMARY KEY (source1_id, target_id)
             ) WITHOUT ROWID;
-            CREATE TABLE truth (source1_id TEXT NOT NULL, target_id TEXT NOT NULL,
-                PRIMARY KEY (source1_id, target_id)) WITHOUT ROWID;
+            CREATE TABLE truth (
+                source1_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                PRIMARY KEY (source1_id, target_id)
+            ) WITHOUT ROWID;
         """)
         self.connection.commit()
 
@@ -138,9 +117,6 @@ class BlockingStore:
         grams = self._grams(text)
         if len(grams) < 3:
             return []
-        # Vectorized universal-hash MinHash.  It has the same deterministic
-        # shingle/signature/band construction as the former library path, but
-        # avoids Python work for every shingle-permutation pair on 10M targets.
         hashes = np.fromiter((zlib.crc32(gram.encode("utf-8")) for gram in grams), dtype=np.uint64, count=len(grams))
         values = np.min((hashes[:, None] * self._MINHASH_A + self._MINHASH_B) % self._MINHASH_PRIME, axis=0)
         band_size = self.MINHASH_PERMUTATIONS // self.MINHASH_BANDS
@@ -158,28 +134,31 @@ class BlockingStore:
 
     def _keys(self, country: str, name: str, core: str, sorted_core: str, address: str,
               numbers: str, rare_tokens: Iterable[str] = ()) -> list[tuple[str, float]]:
-        # Country is intentionally absent from every retrieval key. Country labels
-        # are noisy, open-set strings; agreement is modeled as a feature instead.
         prefix = core[:5]
+        acronym = extract_acronym(core)
         keys = [
-            (f"full:{name}", 12.0) if name else None,
-            (f"core:{core}", 10.0) if core else None,
-            (f"sorted:{sorted_core}", 9.0) if sorted_core else None,
+            (f"full:{name}", 15.0) if name else None,
+            (f"core:{core}", 12.0) if core else None,
+            (f"sorted:{sorted_core}", 10.0) if sorted_core else None,
+            (f"acronym:{acronym}", 8.0) if len(acronym) >= 2 else None,
             (f"address:{address}", 7.0) if address else None,
-            (f"full_composite:{name}|{address}", 20.0) if name and address else None,
+            (f"full_composite:{name}|{address}", 25.0) if name and address else None,
             (f"prefix:{prefix}", 2.0) if len(prefix) == 5 else None,
         ]
         rare_tokens = tuple(rare_tokens)
-        keys.extend((f"number:{number}", 3.0) for number in set(numbers.split()) if len(number) >= 3)
-        keys.extend((f"token:{token}", 5.0) for token in rare_tokens)
-        keys.extend((f"phonetic:{self._soundex(token)}", 2.0)
-                    for token in rare_tokens if self._soundex(token))
-        keys.extend((key, 1.5) for key in self._lsh_keys(core))
+        
+        # De-weight standard street numbers so they don't consume the bucket cap; prioritize postal codes
+        for number in set(numbers.split()):
+            weight = 4.0 if len(number) >= 5 else 0.5
+            keys.append((f"number:{number}", weight))
+
+        keys.extend((f"token:{token}", 6.0) for token in rare_tokens)
+        keys.extend((f"phonetic:{self._soundex(token)}", 2.5) for token in rare_tokens if self._soundex(token))
+        keys.extend((key, 2.0) for key in self._lsh_keys(core))
         keys.extend((key, 1.0) for key in self._lsh_keys(address, prefix="addr_lsh"))
         return [key for key in keys if key is not None]
 
     def _rare_tokens(self, core: str) -> Iterator[str]:
-        """Yield tokens admitted by the Source-1 document-frequency gate."""
         for token in set(core.split()):
             if len(token) < 3:
                 continue
@@ -200,7 +179,6 @@ class BlockingStore:
                 yield token
 
     def build_source_index(self, source1_path: str | Path) -> int:
-        """Count document frequencies, then persist Source 1 records and keys."""
         token_rows, token_count = [], 0
         for row in self._records(source1_path):
             token_rows.extend((token,) for token in set(core_name(row.get("business_name", "")).split()) if len(token) >= 3)
@@ -215,20 +193,14 @@ class BlockingStore:
                 "INSERT INTO token_df(token, frequency) VALUES (?, 1) ON CONFLICT(token) DO UPDATE SET frequency=frequency+1",
                 token_rows,
             )
-            token_count += len(token_rows)
         self.connection.commit()
-        retained = self.connection.execute("SELECT COUNT(*) FROM token_df WHERE frequency <= ?", (self.TOKEN_DF_LIMIT,)).fetchone()[0]
-        total_tokens = self.connection.execute("SELECT COUNT(*) FROM token_df").fetchone()[0]
-        # The gate is defined solely by Source-1 document frequency.  Keeping
-        # its resulting vocabulary in memory makes subsequent Source-1 and
-        # target retrieval deterministic without one SQLite query per token.
+
         self._rare_token_set = {
             row[0] for row in self.connection.execute(
                 "SELECT token FROM token_df WHERE frequency <= ?", (self.TOKEN_DF_LIMIT,)
             )
         }
         self._rare_token_cache.clear()
-        LOGGER.info("Blocking token DF pruning retained %d/%d name tokens (limit=%d)", retained, total_tokens, self.TOKEN_DF_LIMIT)
 
         records, keys, count = [], [], 0
         for row in self._records(source1_path):
@@ -253,13 +225,6 @@ class BlockingStore:
         return count
 
     def _bound_keys(self) -> None:
-        """Retain deterministic capped buckets, prioritising entities with fewer retrieval paths.
-
-        Entities that have fewer total blocking keys are kept first in overloaded
-        buckets because they have fewer alternative chances of being retrieved.
-        This replaces the former ``ORDER BY entity_id`` which arbitrarily kept
-        only the alphabetically-first entries.
-        """
         self.connection.execute("CREATE INDEX IF NOT EXISTS tmp_bk_eid ON block_keys(entity_id)")
         self.connection.execute("""
             CREATE TABLE bounded_keys AS
@@ -295,7 +260,6 @@ class BlockingStore:
         return count
 
     def add_targets_and_retrieve(self, target_paths: Sequence[str | Path]) -> None:
-        """Stream each target file, join its keys in SQLite, and then discard them."""
         for path in target_paths:
             self.connection.execute("CREATE TABLE target_keys (target_id TEXT NOT NULL, key TEXT NOT NULL, weight REAL NOT NULL)")
             target_rows, key_rows, count = [], [], 0
@@ -328,25 +292,15 @@ class BlockingStore:
             LOGGER.info("Retrieved blocking candidates from %s (%d targets)", Path(path).name, count)
 
     def finalize_candidates(self) -> int:
-        """Source-balanced shortlist, C-accelerated RapidFuzz rerank, per-stage diagnostics."""
-        from rapidfuzz import fuzz, process
         diagnostics: dict = {}
         has_truth = self._has_truth()
 
-        # ── Stage 1: raw candidates diagnostics ──
         if has_truth:
             raw_r, raw_hit, raw_tot = self._recall_on_table("raw_candidates")
             diagnostics["raw_blocking"] = {"recall": raw_r, "retrieved": raw_hit, "total": raw_tot}
         raw_stats = self._candidate_stats("raw_candidates")
         diagnostics["raw_stats"] = raw_stats
-        LOGGER.info("Raw candidates: %d pairs, %.1f avg/entity, recall=%.4f%%",
-                    raw_stats["total_pairs"], raw_stats["avg_candidates"],
-                    100 * diagnostics.get("raw_blocking", {}).get("recall", 0))
 
-        # ── Stage 2: source-balanced evidence shortlist ──
-        # Keep top 4*K globally, PLUS ensure at least top K from each source.
-        # This prevents Source-2 from consuming the entire candidate budget.
-        t0 = time.perf_counter()
         self.connection.execute("""
             CREATE TABLE shortlist AS
             WITH raw_filtered AS (
@@ -368,48 +322,66 @@ class BlockingStore:
                             NULLIF(MAX(evidence) OVER (PARTITION BY source1_id) - MIN(evidence) OVER (PARTITION BY source1_id), 0), 1.0) AS evidence
             FROM raw_filtered
         """, (self.top_k * 4, self.top_k))
-        self.connection.execute("ALTER TABLE shortlist ADD COLUMN similarity REAL")
+
         if has_truth:
             sl_r, sl_hit, sl_tot = self._recall_on_table("shortlist")
             diagnostics["shortlist"] = {"recall": sl_r, "retrieved": sl_hit, "total": sl_tot}
-        sl_stats = self._candidate_stats("shortlist")
-        diagnostics["shortlist_stats"] = sl_stats
-        LOGGER.info("Shortlist: %d pairs, %.1f avg/entity (%.1fs), recall=%.4f%%",
-                    sl_stats["total_pairs"], sl_stats["avg_candidates"],
-                    time.perf_counter() - t0,
-                    100 * diagnostics.get("shortlist", {}).get("recall", 0))
+        diagnostics["shortlist_stats"] = self._candidate_stats("shortlist")
 
-        # ── Stage 3: RapidFuzz reranking ──
-        t0 = time.perf_counter()
+        # ── Fast C++ composite reranking & single-pass insertion ──
+        self.connection.execute("""
+            CREATE TABLE scored_candidates (
+                source1_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                evidence REAL NOT NULL, similarity REAL NOT NULL
+            );
+        """)
         reader = self.connection.execute("""
             SELECT c.source1_id, c.target_id, s.core, s.address, t.core, t.address, c.evidence
             FROM shortlist c JOIN source1 s ON s.entity_id=c.source1_id JOIN targets t ON t.entity_id=c.target_id
         """)
-        update_rows = []
+        scored_batch = []
         while True:
-            rows = reader.fetchmany(25_000)
+            rows = reader.fetchmany(50_000)
             if not rows:
                 break
-            name_scores = process.cpdist([row[2] for row in rows], [row[4] for row in rows], scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
-            address_scores = process.cpdist([row[3] for row in rows], [row[5] for row in rows], scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
-            update_rows.extend((float(evidence) + float(name) / 20.0 + float(address) / 100.0, sid, tid)
-                               for (sid, tid, *_unused, evidence), name, address in zip(rows, name_scores, address_scores))
-            if len(update_rows) >= 100_000:
-                self.connection.executemany("UPDATE shortlist SET similarity=? WHERE source1_id=? AND target_id=?", update_rows)
-                update_rows.clear(); self.connection.commit()
-        if update_rows:
-            self.connection.executemany("UPDATE shortlist SET similarity=? WHERE source1_id=? AND target_id=?", update_rows)
-        LOGGER.info("RapidFuzz reranking: %.1fs", time.perf_counter() - t0)
+            s_cores = [r[2] for r in rows]
+            t_cores = [r[4] for r in rows]
+            s_addrs = [r[3] for r in rows]
+            t_addrs = [r[5] for r in rows]
 
-        # ── Stage 4: Final bounded candidates ──
+            name_ratio = process.cpdist(s_cores, t_cores, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
+            name_set = process.cpdist(s_cores, t_cores, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
+            name_scores = np.maximum(name_ratio, name_set)
+            addr_scores = process.cpdist(s_addrs, t_addrs, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
+
+            for (sid, tid, *_, ev), n_s, a_s in zip(rows, name_scores, addr_scores):
+                sim = float(ev) + (float(n_s) / 20.0) + (float(a_s) / 100.0)
+                scored_batch.append((sid, tid, float(ev), sim))
+
+            if len(scored_batch) >= 100_000:
+                self.connection.executemany("INSERT INTO scored_candidates VALUES (?, ?, ?, ?)", scored_batch)
+                scored_batch.clear(); self.connection.commit()
+        if scored_batch:
+            self.connection.executemany("INSERT INTO scored_candidates VALUES (?, ?, ?, ?)", scored_batch)
+            self.connection.commit()
+
+        # Schema-preserving structured insert
         self.connection.execute("""
-            CREATE TABLE final_candidates AS
-            SELECT source1_id, target_id, evidence, similarity,
-                   ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS rank
-            FROM shortlist
+            CREATE TABLE final_candidates (
+                source1_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                evidence REAL NOT NULL, similarity REAL NOT NULL, rank INTEGER NOT NULL,
+                PRIMARY KEY (source1_id, target_id)
+            ) WITHOUT ROWID;
         """)
-        self.connection.execute("DELETE FROM final_candidates WHERE rank > ?", (self.top_k,))
-        self.connection.execute("CREATE UNIQUE INDEX final_pair ON final_candidates(source1_id, target_id)")
+        self.connection.execute("""
+            INSERT INTO final_candidates
+            SELECT source1_id, target_id, evidence, similarity, rank FROM (
+                SELECT source1_id, target_id, evidence, similarity,
+                       ROW_NUMBER() OVER (PARTITION BY source1_id ORDER BY similarity DESC, target_id) AS rank
+                FROM scored_candidates
+            ) WHERE rank <= ?
+        """, (self.top_k,))
+        self.connection.execute("DROP TABLE scored_candidates")
         self.connection.execute("DROP TABLE shortlist")
         self.connection.execute("DROP TABLE raw_candidates")
         self.connection.commit()
@@ -419,11 +391,11 @@ class BlockingStore:
             diagnostics["final"] = {"recall": fin_r, "retrieved": fin_hit, "total": fin_tot}
         fin_stats = self._candidate_stats("final_candidates")
         diagnostics["final_stats"] = fin_stats
-        LOGGER.info("Final candidates: %d pairs, %.1f avg/entity, recall=%.4f%%",
-                    fin_stats["total_pairs"], fin_stats["avg_candidates"],
-                    100 * diagnostics.get("final", {}).get("recall", 0))
 
         self.diagnostics = diagnostics
+        LOGGER.info("Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity)",
+                    100 * diagnostics.get("final", {}).get("recall", 0),
+                    fin_stats["total_pairs"], fin_stats["avg_candidates"])
         return fin_stats["total_pairs"]
 
     def recall_ceiling(self, where: str = "", parameters: Sequence[object] = ()) -> tuple[float, int, int]:
@@ -466,25 +438,10 @@ class BlockingStore:
             f"SELECT COUNT(*) FROM final_candidates c JOIN source1 s ON s.entity_id=c.source1_id {predicate}", parameters
         ).fetchone()[0]
 
-    def update_probabilities(self, pairs: Sequence[tuple[str, str]], probabilities: Sequence[float]) -> None:
-        if len(pairs) != len(probabilities):
-            raise ValueError("pairs and probabilities must have the same length")
-        self.connection.execute("ALTER TABLE final_candidates ADD COLUMN probability REAL") if not self._has_probability() else None
-        self.connection.executemany(
-            "UPDATE final_candidates SET probability=? WHERE source1_id=? AND target_id=?",
-            ((float(probability), source_id, target_id) for (source_id, target_id), probability in zip(pairs, probabilities)),
-        )
-        self.connection.commit()
-
-    def _has_probability(self) -> bool:
-        return any(row[1] == "probability" for row in self.connection.execute("PRAGMA table_info(final_candidates)"))
-
     def _has_truth(self) -> bool:
-        """Check if the truth table has any rows."""
         return self.connection.execute("SELECT COUNT(*) FROM truth").fetchone()[0] > 0
 
     def _recall_on_table(self, table: str, where: str = "", parameters: Sequence[object] = ()) -> tuple[float, int, int]:
-        """Measure recall of truth pairs present in the given candidate table."""
         predicate = f"WHERE {where}" if where else ""
         total = self.connection.execute(
             f"SELECT COUNT(*) FROM truth t JOIN source1 s ON s.entity_id=t.source1_id {predicate}", parameters
@@ -496,18 +453,14 @@ class BlockingStore:
         return (retrieved / total if total else 1.0), retrieved, total
 
     def _candidate_stats(self, table: str) -> dict:
-        """Compute candidate count distribution statistics."""
-        counts = [r[0] for r in self.connection.execute(
-            f"SELECT COUNT(*) FROM {table} GROUP BY source1_id ORDER BY COUNT(*)")]
+        counts = [r[0] for r in self.connection.execute(f"SELECT COUNT(*) FROM {table} GROUP BY source1_id")]
         if not counts:
-            return {"total_pairs": 0, "avg_candidates": 0.0, "median_candidates": 0,
-                    "p90_candidates": 0, "p95_candidates": 0, "max_candidates": 0}
+            return {"total_pairs": 0, "avg_candidates": 0.0, "median_candidates": 0, "max_candidates": 0}
         n = len(counts)
+        counts.sort()
         return {
             "total_pairs": sum(counts),
             "avg_candidates": sum(counts) / n,
             "median_candidates": counts[n // 2],
-            "p90_candidates": counts[min(int(n * 0.9), n - 1)],
-            "p95_candidates": counts[min(int(n * 0.95), n - 1)],
             "max_candidates": counts[-1],
         }

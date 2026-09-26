@@ -1,8 +1,4 @@
-"""Batched lexical features for the bounded candidate set.
-
-No embedding model is used.  The former SentenceTransformer path could silently
-produce an all-zero feature without an offline model cache, so it was removed.
-"""
+"""Batched, highly vectorized lexical and structural features for candidate pairs."""
 from __future__ import annotations
 
 from typing import Mapping, Sequence
@@ -12,20 +8,40 @@ from rapidfuzz import fuzz, process
 from sklearn.feature_extraction.text import HashingVectorizer
 
 from .data import Record
-from .preprocessing import extract_address_numbers, core_name, normalize_address, normalize_name
+from .preprocessing import (
+    core_name,
+    extract_acronym,
+    extract_address_numbers,
+    extract_postal_code,
+    normalize_address,
+    normalize_name,
+)
 
 FEATURE_NAMES = [
-    "name_exact", "core_exact", "sorted_core_exact", "address_exact", "country_match", "country_missing",
-    "name_ratio", "core_ratio", "address_ratio", "name_token_sort_ratio", "name_token_set_ratio",
-    "address_token_sort_ratio", "address_token_set_ratio", "name_char_trigram_cosine", "address_char_trigram_cosine",
+    # Exact matches
+    "name_exact", "core_exact", "sorted_core_exact", "address_exact",
+    # Country signals
+    "country_match", "country_missing", "country_both_missing", "country_conflict",
+    # RapidFuzz edit & token ratios
+    "name_ratio", "core_ratio", "address_ratio",
+    "name_token_sort_ratio", "name_token_set_ratio", "address_token_sort_ratio", "address_token_set_ratio",
+    "name_partial_ratio", "core_partial_ratio",
+    # Containment & Acronym
+    "name_token_containment", "address_token_containment", "acronym_match",
+    # Postal / Numbers
+    "address_number_jaccard", "first_number_match", "postal_match", "postal_conflict",
+    # Hashed 3-gram cosine
+    "name_char_trigram_cosine", "address_char_trigram_cosine",
+    # Token overlap & Jaccard
     "name_token_jaccard", "name_token_overlap", "address_token_jaccard", "address_token_overlap",
-    "address_number_jaccard", "first_number_match", "name_length_ratio", "address_length_ratio",
-    "candidate_rank", "blocking_similarity",
-    # Missingness, source, and structural features
+    # Length & token counts
+    "name_length_ratio", "address_length_ratio", "name_token_count_diff", "core_token_count_diff",
+    # Retrieval prior signals
+    "candidate_rank", "blocking_similarity", "target_source",
+    # Legal suffix consistency
+    "legal_suffix_agree", "legal_suffix_conflict",
+    # Missingness
     "name_missing_left", "name_missing_right", "address_missing_left", "address_missing_right",
-    "target_source", "legal_suffix_agree", "legal_suffix_conflict",
-    "name_token_count_diff", "core_token_count_diff",
-    "country_both_missing", "country_conflict",
 ]
 
 _CHAR_TRIGRAMS = HashingVectorizer(
@@ -39,17 +55,26 @@ def _tokens(value: str) -> set[str]:
 
 
 def _token_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
-    jaccard, overlap = np.zeros(len(left), dtype=np.float32), np.zeros(len(left), dtype=np.float32)
+    jaccard = np.zeros(len(left), dtype=np.float32)
+    overlap = np.zeros(len(left), dtype=np.float32)
     for index, (a, b) in enumerate(zip(left, right)):
-        a_tokens, b_tokens = _tokens(a), _tokens(b)
-        union = a_tokens | b_tokens
-        jaccard[index] = len(a_tokens & b_tokens) / len(union) if union else 1.0
-        overlap[index] = len(a_tokens & b_tokens)
+        ta, tb = _tokens(a), _tokens(b)
+        union = ta | tb
+        jaccard[index] = len(ta & tb) / len(union) if union else 1.0
+        overlap[index] = float(len(ta & tb))
     return jaccard, overlap
 
 
+def _containment_scores(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
+    containment = np.zeros(len(left), dtype=np.float32)
+    for index, (a, b) in enumerate(zip(left, right)):
+        ta, tb = _tokens(a), _tokens(b)
+        m = min(len(ta), len(tb))
+        containment[index] = len(ta & tb) / m if m > 0 else 0.0
+    return containment
+
+
 def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
-    """Fit-free character 3-gram cosine for already-bounded candidate pairs."""
     left_matrix = _CHAR_TRIGRAMS.transform(left)
     right_matrix = _CHAR_TRIGRAMS.transform(right)
     numerator = np.asarray(left_matrix.multiply(right_matrix).sum(axis=1)).ravel()
@@ -59,79 +84,121 @@ def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
 
 
 def _number_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
-    jaccard, first_match = np.full(len(left), 0.5, dtype=np.float32), np.full(len(left), 0.5, dtype=np.float32)
+    jaccard = np.full(len(left), 0.5, dtype=np.float32)
+    first_match = np.full(len(left), 0.5, dtype=np.float32)
     for index, (a, b) in enumerate(zip(left, right)):
-        left_values, right_values = a.split(), b.split()
-        if left_values and right_values:
-            union = set(left_values) | set(right_values)
-            jaccard[index] = len(set(left_values) & set(right_values)) / len(union)
-            first_match[index] = float(left_values[0] == right_values[0])
+        lv, rv = a.split(), b.split()
+        if lv and rv:
+            union = set(lv) | set(rv)
+            jaccard[index] = len(set(lv) & set(rv)) / len(union)
+            first_match[index] = float(lv[0] == rv[0])
     return jaccard, first_match
 
 
+def _postal_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+    match = np.zeros(len(left), dtype=np.float32)
+    conflict = np.zeros(len(left), dtype=np.float32)
+    for i, (a, b) in enumerate(zip(left, right)):
+        p1, p2 = extract_postal_code(a), extract_postal_code(b)
+        if p1 and p2:
+            if p1 == p2:
+                match[i] = 1.0
+            else:
+                conflict[i] = 1.0
+    return match, conflict
+
+
+def _acronym_matches(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
+    matches = np.zeros(len(left), dtype=np.float32)
+    for i, (a, b) in enumerate(zip(left, right)):
+        acr_a, acr_b = extract_acronym(a), extract_acronym(b)
+        if (acr_a and acr_a == b) or (acr_b and acr_b == a) or (acr_a and acr_b and acr_a == acr_b):
+            matches[i] = 1.0
+    return matches
+
+
 def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
-    """Vectorize one DB batch; edit distances use RapidFuzz's C++ cpdist."""
+    """Vectorize a batch of DB rows using multithreaded RapidFuzz and NumPy."""
     if not rows:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
-    # (sid, tid, s_country, s_name, s_core, s_sorted, s_address, s_numbers,
-    #  t_country, t_name, t_core, t_sorted, t_address, t_numbers, evidence, similarity, rank)
+
     columns = list(zip(*rows))
     s_country, s_name, s_core, s_sorted, s_address, s_numbers = columns[2:8]
     t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
     evidence, similarity, rank = columns[14:17]
-    name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    address_ratio = process.cpdist(s_address, t_address, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    name_token_sort = process.cpdist(s_name, t_name, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    name_token_set = process.cpdist(s_name, t_name, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    address_token_sort = process.cpdist(s_address, t_address, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
-    address_token_set = process.cpdist(s_address, t_address, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100
+
+    # RapidFuzz scorers
+    name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    address_ratio = process.cpdist(s_address, t_address, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    name_token_sort = process.cpdist(s_name, t_name, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    name_token_set = process.cpdist(s_name, t_name, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    address_token_sort = process.cpdist(s_address, t_address, scorer=fuzz.token_sort_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    address_token_set = process.cpdist(s_address, t_address, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    name_partial = process.cpdist(s_name, t_name, scorer=fuzz.partial_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    core_partial = process.cpdist(s_core, t_core, scorer=fuzz.partial_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+
     name_jaccard, name_overlap = _token_scores(s_core, t_core)
     address_jaccard, address_overlap = _token_scores(s_address, t_address)
+    name_containment = _containment_scores(s_core, t_core)
+    address_containment = _containment_scores(s_address, t_address)
+    acronym_match = _acronym_matches(s_core, t_core)
+
     number_jaccard, first_number_match = _number_scores(s_numbers, t_numbers)
-    s_name_len, t_name_len = np.asarray([len(value) for value in s_name]), np.asarray([len(value) for value in t_name])
-    s_addr_len, t_addr_len = np.asarray([len(value) for value in s_address]), np.asarray([len(value) for value in t_address])
-    # Legal suffix: difference between normalized name and core name
-    s_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, '', 1).strip()
-                for n, c in zip(s_name, s_core)]
-    t_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, '', 1).strip()
-                for n, c in zip(t_name, t_core)]
+    postal_match, postal_conflict = _postal_scores(s_address, t_address)
+
+    s_name_len = np.asarray([len(v) for v in s_name], dtype=np.float32)
+    t_name_len = np.asarray([len(v) for v in t_name], dtype=np.float32)
+    s_addr_len = np.asarray([len(v) for v in s_address], dtype=np.float32)
+    t_addr_len = np.asarray([len(v) for v in t_address], dtype=np.float32)
+
+    s_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, "", 1).strip() for n, c in zip(s_name, s_core)]
+    t_suffix = [n[len(c):].strip() if n.startswith(c) else n.replace(c, "", 1).strip() for n, c in zip(t_name, t_core)]
+
     return np.column_stack((
+        # Exact
         np.asarray([bool(a) and a == b for a, b in zip(s_name, t_name)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_core, t_core)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_sorted, t_sorted)], dtype=np.float32),
         np.asarray([bool(a) and a == b for a, b in zip(s_address, t_address)], dtype=np.float32),
+        # Country
         np.asarray([bool(a) and a == b for a, b in zip(s_country, t_country)], dtype=np.float32),
         np.asarray([not a or not b for a, b in zip(s_country, t_country)], dtype=np.float32),
-        name_ratio, core_ratio, address_ratio, name_token_sort, name_token_set, address_token_sort, address_token_set,
+        np.asarray([not a and not b for a, b in zip(s_country, t_country)], dtype=np.float32),
+        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_country, t_country)], dtype=np.float32),
+        # RapidFuzz
+        name_ratio, core_ratio, address_ratio,
+        name_token_sort, name_token_set, address_token_sort, address_token_set,
+        name_partial, core_partial,
+        # Containment & Acronym
+        name_containment, address_containment, acronym_match,
+        # Numbers & Postals
+        number_jaccard, first_number_match, postal_match, postal_conflict,
+        # Trigrams
         _hashed_cosine(s_name, t_name), _hashed_cosine(s_address, t_address),
-        name_jaccard, name_overlap, address_jaccard, address_overlap, number_jaccard, first_number_match,
-        np.minimum(s_name_len, t_name_len) / np.maximum(np.maximum(s_name_len, t_name_len), 1),
-        np.minimum(s_addr_len, t_addr_len) / np.maximum(np.maximum(s_addr_len, t_addr_len), 1),
-        np.asarray(rank, dtype=np.float32), np.asarray(similarity, dtype=np.float32),
-        # ── Missingness features ──
+        # Token scores
+        name_jaccard, name_overlap, address_jaccard, address_overlap,
+        # Length & Counts
+        np.minimum(s_name_len, t_name_len) / np.maximum(np.maximum(s_name_len, t_name_len), 1.0),
+        np.minimum(s_addr_len, t_addr_len) / np.maximum(np.maximum(s_addr_len, t_addr_len), 1.0),
+        np.abs(np.asarray([len(a.split()) for a in s_name], dtype=np.float32) - np.asarray([len(b.split()) for b in t_name], dtype=np.float32)),
+        np.abs(np.asarray([len(a.split()) for a in s_core], dtype=np.float32) - np.asarray([len(b.split()) for b in t_core], dtype=np.float32)),
+        # Retrieval
+        np.asarray(rank, dtype=np.float32),
+        np.asarray(similarity, dtype=np.float32),
+        np.asarray([3.0 if tid.startswith("S3-") else 2.0 for tid in columns[1]], dtype=np.float32),
+        # Suffix
+        np.asarray([bool(a) and a == b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
+        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
+        # Missingness
         np.asarray([not a for a in s_name], dtype=np.float32),
         np.asarray([not a for a in t_name], dtype=np.float32),
         np.asarray([not a for a in s_address], dtype=np.float32),
         np.asarray([not a for a in t_address], dtype=np.float32),
-        # ── Target source (2=S2, 3=S3) ──
-        np.asarray([3.0 if tid.startswith('S3-') else 2.0 for tid in columns[1]], dtype=np.float32),
-        # ── Legal suffix agreement / conflict ──
-        np.asarray([bool(a) and a == b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
-        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_suffix, t_suffix)], dtype=np.float32),
-        # ── Token count differences ──
-        np.abs(np.asarray([len(a.split()) for a in s_name], dtype=np.float32) -
-               np.asarray([len(a.split()) for a in t_name], dtype=np.float32)),
-        np.abs(np.asarray([len(a.split()) for a in s_core], dtype=np.float32) -
-               np.asarray([len(a.split()) for a in t_core], dtype=np.float32)),
-        # ── Refined country features ──
-        np.asarray([not a and not b for a, b in zip(s_country, t_country)], dtype=np.float32),
-        np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_country, t_country)], dtype=np.float32),
     )).astype(np.float32, copy=False)
 
 
 def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -> dict[str, float]:
-    """Compatibility helper for small diagnostics and unit tests."""
     s_name, t_name = normalize_name(left.get("business_name", "")), normalize_name(right.get("business_name", ""))
     s_core, t_core = core_name(left.get("business_name", "")), core_name(right.get("business_name", ""))
     s_address, t_address = normalize_address(left.get("business_address", "")), normalize_address(right.get("business_address", ""))
@@ -140,22 +207,3 @@ def pair_features(left: Record, right: Record, retrieval: Mapping[str, float]) -
            str(right.get("country", "")).casefold(), t_name, t_core, t_sorted, t_address, extract_address_numbers(t_address),
            0.0, float(retrieval.get("similarity", 0.0)), float(retrieval.get("rank", 0.0)))
     return dict(zip(FEATURE_NAMES, feature_batch([row])[0].tolist()))
-
-
-def feature_matrix(candidates: Mapping[tuple[str, str], dict], source1: Sequence[Record], source2: Sequence[Record], source3: Sequence[Record]):
-    """Small-data compatibility API. Production uses feature_batch over SQLite rows."""
-    left = {record["entity_id"]: record for record in source1}
-    right = {record["entity_id"]: record for record in (*source2, *source3)}
-    rows, pairs = [], []
-    for (source_id, target_id), retrieval in candidates.items():
-        if source_id not in left or target_id not in right:
-            continue
-        s, t = left[source_id], right[target_id]
-        s_name, t_name = normalize_name(s.get("business_name", "")), normalize_name(t.get("business_name", ""))
-        s_core, t_core = core_name(s.get("business_name", "")), core_name(t.get("business_name", ""))
-        s_address, t_address = normalize_address(s.get("business_address", "")), normalize_address(t.get("business_address", ""))
-        rows.append((source_id, target_id, str(s.get("country", "")).casefold(), s_name, s_core, " ".join(sorted(s_core.split())), s_address, extract_address_numbers(s_address),
-                     str(t.get("country", "")).casefold(), t_name, t_core, " ".join(sorted(t_core.split())), t_address, extract_address_numbers(t_address),
-                     0.0, retrieval.get("similarity", 0.0), retrieval.get("rank", 0.0)))
-        pairs.append((source_id, target_id))
-    return feature_batch(rows), pairs, list(FEATURE_NAMES)
