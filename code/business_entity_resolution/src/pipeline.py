@@ -55,7 +55,10 @@ def _build_store(data_dir: str | Path, split: str, database: Path, top_k: int, w
     return store
 
 
-def _materialize(store: BlockingStore, scratch: Path, name: str, where: str = "", parameters: Sequence[object] = (), labels: bool = True) -> MatrixFiles:
+def _materialize(store: BlockingStore, scratch: Path, name: str, where: str = "", parameters: Sequence[object] = (), labels: bool = True, subsample: bool = False) -> MatrixFiles:
+    if labels and subsample:
+        cond = "(truth.target_id IS NOT NULL OR c.similarity > 0.65 OR c.rank <= 4 OR (length(s.name) + length(t.name) + c.rank) % 10 = 0)"
+        where = f"({where}) AND {cond}" if where else cond
     rows = store.feature_count(where, parameters)
     x_path, pairs_path = scratch / f"{name}.features.f32", scratch / f"{name}.pairs.tsv"
     y_path = scratch / f"{name}.labels.i8" if labels else None
@@ -244,9 +247,9 @@ def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir:
     store = _build_store(data_dir, "train", scratch / "train_validation.sqlite", top_k, with_truth=True)
     train_country, validation_country = _countries(store)
 
-    fit = _materialize(store, scratch, "country_fit", "s.country=?", (train_country,))
+    fit = _materialize(store, scratch, "country_fit", "s.country=?", (train_country,), subsample=True)
     valid = _materialize(store, scratch, "country_valid", "s.country=?", (validation_country,))
-    in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", ())
+    in_fit = _materialize(store, scratch, "id_fit", "s.split<>0", (), subsample=True)
     in_valid = _materialize(store, scratch, "id_valid", "s.split=0", ())
 
     selected, country_score, country_threshold, weight_results = _select_model(
@@ -295,29 +298,23 @@ def predict(test_dir: str | Path, output_dir: str | Path, train_dir: str | Path,
     train_store = _build_store(train_dir, "train", scratch / "train_predict.sqlite", top_k, with_truth=True)
     train_country, validation_country = _countries(train_store)
 
-    fit = _materialize(train_store, scratch, "threshold_fit", "s.country=?", (train_country,))
+    fit = _materialize(train_store, scratch, "threshold_fit", "s.country=?", (train_country,), subsample=True)
     tune = _materialize(train_store, scratch, "threshold_tune", "s.country=?", (validation_country,))
-    in_fit = _materialize(train_store, scratch, "predict_id_fit", "s.split<>0", ())
+    in_fit = _materialize(train_store, scratch, "predict_id_fit", "s.split<>0", (), subsample=True)
     in_tune = _materialize(train_store, scratch, "predict_id_tune", "s.split=0", ())
 
     selected, _, country_threshold, _ = _select_model(
         train_store, fit, tune, in_fit, in_tune, "s.country=?", (validation_country,), seed,
     )
 
-    rev_fit = _materialize(train_store, scratch, "predict_rev_fit", "s.country=?", (validation_country,))
-    rev_tune = _materialize(train_store, scratch, "predict_rev_tune", "s.country=?", (train_country,))
     _, class_weight, scale_pos_weight = selected
-    rev_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(rev_fit.x(), rev_fit.y())
-    rev_probs = _batched_predict_proba(rev_model, rev_tune)
-    _, rev_threshold = _fast_tune_threshold(train_store, rev_tune, rev_probs, "s.country=?", (train_country,))
-
     in_model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(in_fit.x(), in_fit.y())
     in_probs = _batched_predict_proba(in_model, in_tune)
-    _, in_threshold = _fast_tune_threshold(train_store, in_tune, in_probs, "s.split=0", ())
-
-    threshold = max((country_threshold + rev_threshold) / 2.0, in_threshold)
+    _, threshold = _fast_tune_threshold(train_store, in_tune, in_probs, "s.split=0", ())
     
-    full = _materialize(train_store, scratch, "full_train", labels=True)
+    LOGGER.info("Calibrated final threshold %.3f using S1-grouped validation (split=0)", threshold)
+    
+    full = _materialize(train_store, scratch, "full_train", labels=True, subsample=True)
     model = PairModel(seed, class_weight=class_weight, scale_pos_weight=scale_pos_weight).fit(full.x(), full.y())
     train_store.close()
 

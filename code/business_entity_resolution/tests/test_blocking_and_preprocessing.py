@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from business_entity_resolution.src.blocking import BlockingStore
-from business_entity_resolution.src.preprocessing import normalize_address
+from src.blocking import BlockingStore
+from src.preprocessing import normalize_address
 
 
 class BlockingAndPreprocessingTests(unittest.TestCase):

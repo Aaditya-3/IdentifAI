@@ -1,11 +1,11 @@
 import time
 from pathlib import Path
-from business_entity_resolution.src.pipeline import validate
-from business_entity_resolution.src.blocking import BlockingStore
+from src.pipeline import validate
+from src.blocking import BlockingStore
 
 def sweep():
     results = []
-    top_ks = [20, 30]
+    top_ks = [10, 15, 20, 25, 30, 40, 50, 64, 80]
     key_caps = [160]
     
     for key_cap in key_caps:
@@ -16,7 +16,7 @@ def sweep():
             
             t_start = time.time()
             score, threshold = validate(
-                data_dir="student_resource/dataset/train",
+                data_dir="../../student_resource/dataset/train",
                 top_k=k,
                 seed=42,
                 scratch_dir="scratch"

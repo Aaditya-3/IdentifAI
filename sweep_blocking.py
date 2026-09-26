@@ -4,7 +4,10 @@ from pathlib import Path
 
 import numpy as np
 
-from business_entity_resolution.src.blocking import BlockingStore
+import sys
+from pathlib import Path
+sys.path.append(str(Path("code/business_entity_resolution").absolute()))
+from src.blocking import BlockingStore
 
 def monkey_patched_lsh_keys(self, text: str, prefix: str = "lsh") -> list[str]:
     import zlib

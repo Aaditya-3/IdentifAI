@@ -75,13 +75,43 @@ def _containment_scores(left: Sequence[str], right: Sequence[str]) -> np.ndarray
     return containment
 
 
+_HASH_CACHE = {}
+
 def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
-    left_matrix = _CHAR_TRIGRAMS.transform(left)
-    right_matrix = _CHAR_TRIGRAMS.transform(right)
-    numerator = np.asarray(left_matrix.multiply(right_matrix).sum(axis=1)).ravel()
-    left_norm = np.sqrt(np.asarray(left_matrix.multiply(left_matrix).sum(axis=1)).ravel())
-    right_norm = np.sqrt(np.asarray(right_matrix.multiply(right_matrix).sum(axis=1)).ravel())
-    return np.divide(numerator, left_norm * right_norm, out=np.zeros(len(left), dtype=np.float32), where=(left_norm * right_norm) > 0)
+    global _HASH_CACHE
+    if len(_HASH_CACHE) > 200_000:
+        _HASH_CACHE.clear()
+
+    def _get(strings: Sequence[str]) -> tuple[list, np.ndarray]:
+        missing_idx = []
+        missing_str = []
+        mats = [None] * len(strings)
+        norms = np.zeros(len(strings), dtype=np.float32)
+        for i, s in enumerate(strings):
+            cached = _HASH_CACHE.get(s)
+            if cached is not None:
+                mats[i], norms[i] = cached
+            else:
+                missing_idx.append(i)
+                missing_str.append(s)
+        if missing_str:
+            new_mats = _CHAR_TRIGRAMS.transform(missing_str)
+            new_norms = np.sqrt(np.asarray(new_mats.multiply(new_mats).sum(axis=1)).ravel())
+            for i, m, n, s in zip(missing_idx, new_mats, new_norms, missing_str):
+                _HASH_CACHE[s] = (m, n)
+                mats[i] = m
+                norms[i] = n
+        return mats, norms
+
+    l_mats, l_norms = _get(left)
+    r_mats, r_norms = _get(right)
+    
+    numerator = np.zeros(len(left), dtype=np.float32)
+    for i, (lm, rm) in enumerate(zip(l_mats, r_mats)):
+        numerator[i] = lm.multiply(rm).sum()
+        
+    denom = l_norms * r_norms
+    return np.divide(numerator, denom, out=np.zeros(len(left), dtype=np.float32), where=denom > 0)
 
 
 def _number_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:

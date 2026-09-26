@@ -6,12 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from business_entity_resolution.src.blocking import BlockingStore
-from business_entity_resolution.src.features import FEATURE_NAMES, feature_batch
-from business_entity_resolution.src.metrics import macro_f0_5
-from business_entity_resolution.src.model import PairModel
-from business_entity_resolution.src.output import enforce_candidate_subset, group_candidates
-from business_entity_resolution.src.preprocessing import (
+from src.blocking import BlockingStore
+from src.features import FEATURE_NAMES, feature_batch
+from src.metrics import macro_f0_5
+from src.model import PairModel
+from src.output import enforce_candidate_subset, group_candidates
+from src.preprocessing import (
     core_name, extract_address_numbers, normalize_address, normalize_name,
 )
 

@@ -6,9 +6,9 @@ from pathlib import Path
 
 import numpy as np
 
-from business_entity_resolution.src.blocking import BlockingStore
-from business_entity_resolution.src.output import write_submission_from_database
-from business_entity_resolution.src.pipeline import predict
+from src.blocking import BlockingStore
+from src.output import write_submission_from_database
+from src.pipeline import predict
 
 class TestMissingRequirements(unittest.TestCase):
     def test_bound_keys_priority_queue(self):
@@ -94,7 +94,7 @@ class TestMissingRequirements(unittest.TestCase):
 
     def test_integration_pipeline_metrics(self):
         """One synthetic end-to-end integration test with hand-computed F0.5."""
-        from business_entity_resolution.src.pipeline import _build_store, _materialize, _fast_tune_threshold
+        from src.pipeline import _build_store, _materialize, _fast_tune_threshold
         
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

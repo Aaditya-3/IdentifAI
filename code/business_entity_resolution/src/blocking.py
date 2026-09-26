@@ -239,7 +239,7 @@ class BlockingStore:
                     ) AS position
                 FROM block_keys bk
                 JOIN entity_key_counts ekc ON ekc.entity_id = bk.entity_id
-            ) WHERE position <= ? OR key LIKE 'full_composite:%'
+            ) WHERE position <= ?
         """, (self.key_cap,))
         self.connection.execute("CREATE INDEX bounded_keys_key ON bounded_keys(key)")
         self.connection.execute("DROP TABLE block_keys")
@@ -260,8 +260,9 @@ class BlockingStore:
         return count
 
     def add_targets_and_retrieve(self, target_paths: Sequence[str | Path]) -> None:
+        self.connection.execute("CREATE TABLE all_target_keys (target_id TEXT NOT NULL, key TEXT NOT NULL, weight REAL NOT NULL)")
+        valid_keys = {row[0] for row in self.connection.execute("SELECT DISTINCT key FROM bounded_keys")}
         for path in target_paths:
-            self.connection.execute("CREATE TABLE target_keys (target_id TEXT NOT NULL, key TEXT NOT NULL, weight REAL NOT NULL)")
             target_rows, key_rows, count = [], [], 0
             for row in self._records(path):
                 entity_id = (row.get("entity_id") or "").strip()
@@ -270,26 +271,45 @@ class BlockingStore:
                 country, name, core, sorted_core, address, numbers = self._derived(row)
                 target_rows.append((entity_id, country, name, core, sorted_core, address, numbers))
                 rare_tokens = self._rare_tokens(core)
-                key_rows.extend((entity_id, key, weight) for key, weight in self._keys(country, name, core, sorted_core, address, numbers, rare_tokens))
+                key_rows.extend((entity_id, key, weight) for key, weight in self._keys(country, name, core, sorted_core, address, numbers, rare_tokens) if key in valid_keys)
                 count += 1
                 if count % 20_000 == 0:
                     self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?)", target_rows)
-                    self.connection.executemany("INSERT INTO target_keys VALUES (?, ?, ?)", key_rows)
+                    self.connection.executemany("INSERT INTO all_target_keys VALUES (?, ?, ?)", key_rows)
                     target_rows.clear(); key_rows.clear(); self.connection.commit()
             if target_rows:
                 self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?)", target_rows)
-                self.connection.executemany("INSERT INTO target_keys VALUES (?, ?, ?)", key_rows)
-            self.connection.execute("CREATE INDEX target_keys_key ON target_keys(key)")
-            self.connection.execute("""
-                INSERT INTO raw_candidates(source1_id, target_id, evidence)
-                SELECT b.entity_id, t.target_id, SUM(b.weight * t.weight)
-                FROM target_keys t JOIN bounded_keys b ON b.key = t.key
-                GROUP BY b.entity_id, t.target_id
-                ON CONFLICT(source1_id, target_id) DO UPDATE SET evidence=evidence + excluded.evidence
-            """)
-            self.connection.execute("DROP TABLE target_keys")
+                self.connection.executemany("INSERT INTO all_target_keys VALUES (?, ?, ?)", key_rows)
             self.connection.commit()
-            LOGGER.info("Retrieved blocking candidates from %s (%d targets)", Path(path).name, count)
+            LOGGER.info("Retrieved target blocks from %s (%d targets)", Path(path).name, count)
+            
+        self.connection.execute("CREATE INDEX atk_key ON all_target_keys(key)")
+        self.connection.execute("""
+            CREATE TABLE bounded_target_keys AS
+            WITH key_counts AS (
+                SELECT key, COUNT(*) AS key_count FROM all_target_keys GROUP BY key
+            )
+            SELECT key, target_id, weight FROM (
+                SELECT t.key, t.target_id, t.weight,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY t.key
+                        ORDER BY c.key_count ASC, t.target_id
+                    ) AS position
+                FROM all_target_keys t
+                JOIN key_counts c ON c.key = t.key
+            ) WHERE position <= ?
+        """, (self.key_cap,))
+        self.connection.execute("CREATE INDEX btk_key ON bounded_target_keys(key)")
+        self.connection.execute("""
+            INSERT INTO raw_candidates(source1_id, target_id, evidence)
+            SELECT b.entity_id, t.target_id, SUM(b.weight * t.weight)
+            FROM bounded_target_keys t JOIN bounded_keys b ON b.key = t.key
+            GROUP BY b.entity_id, t.target_id
+            ON CONFLICT(source1_id, target_id) DO UPDATE SET evidence=evidence + excluded.evidence
+        """)
+        self.connection.execute("DROP TABLE all_target_keys")
+        self.connection.execute("DROP TABLE bounded_target_keys")
+        self.connection.commit()
 
     def finalize_candidates(self) -> int:
         diagnostics: dict = {}
@@ -443,7 +463,7 @@ class BlockingStore:
     def feature_count(self, where: str = "", parameters: Sequence[object] = ()) -> int:
         predicate = f"WHERE {where}" if where else ""
         return self.connection.execute(
-            f"SELECT COUNT(*) FROM final_candidates c JOIN source1 s ON s.entity_id=c.source1_id {predicate}", parameters
+            f"SELECT COUNT(*) FROM final_candidates c JOIN source1 s ON s.entity_id=c.source1_id LEFT JOIN truth ON truth.source1_id=c.source1_id AND truth.target_id=c.target_id {predicate}", parameters
         ).fetchone()[0]
 
     def _has_truth(self) -> bool:
