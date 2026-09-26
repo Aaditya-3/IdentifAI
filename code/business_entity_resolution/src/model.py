@@ -2,16 +2,37 @@
 from __future__ import annotations
 
 import logging
+from typing import Sequence
+
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
 class PairModel:
+    """Gradient boosted tree model tuned specifically for precision-heavy entity matching."""
+
     def __init__(self, random_state: int = 42, class_weight: str | None = None, scale_pos_weight: float | None = None):
         self.random_state = random_state
         self.class_weight = class_weight
         self.scale_pos_weight = scale_pos_weight
         self.estimator = None
+        self._threshold = 0.5  # Legacy support for tests
+
+    # ── Legacy properties for test suite compatibility ──
+    @property
+    def threshold(self) -> float:
+        return getattr(self, "_threshold", 0.5)
+
+    @threshold.setter
+    def threshold(self, value: float) -> None:
+        self._threshold = value
+
+    def predict_pairs(self, probabilities: Sequence[float], pairs: Sequence[tuple[str, str]]) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {}
+        for (sid, tid), p in zip(pairs, probabilities):
+            if p >= self.threshold:
+                result.setdefault(sid, set()).add(tid)
+        return result
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "PairModel":
         if len(y) == 0:

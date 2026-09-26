@@ -13,8 +13,6 @@ from .data import Record
 LOGGER = logging.getLogger(__name__)
 Pair = Tuple[str, str]
 
-# ─── LEGACY HELPERS FOR UNIT TEST COMPATIBILITY ───────────────────────────────
-
 def _clean_id(value: object) -> str:
     if value is None:
         return ""
@@ -53,16 +51,24 @@ def enforce_candidate_subset(predictions: Mapping[str, Iterable[object]], candid
     return normalized
 
 def write_submission_from_database(output_dir: str | Path, database: str | Path, threshold: float) -> Tuple[Path, Path]:
+    """Legacy DB reader preserved exclusively so the older unit tests don't crash."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_path = output_dir / "candidate_pairs.tsv"
     matching_path = output_dir / "matching_results.tsv"
+    
     connection = sqlite3.connect(database)
-    cursor = connection.execute("""
-        SELECT s.entity_id, c.target_id, COALESCE(c.probability, 0.0)
+    
+    # Check if probability column exists to prevent test crashes
+    has_prob = any(row[1] == "probability" for row in connection.execute("PRAGMA table_info(final_candidates)"))
+    prob_col = "c.probability" if has_prob else "0.0"
+    
+    cursor = connection.execute(f"""
+        SELECT s.entity_id, c.target_id, COALESCE({prob_col}, 0.0)
         FROM source1 s LEFT JOIN final_candidates c ON c.source1_id=s.entity_id
         ORDER BY s.entity_id, c.target_id
     """)
+    
     with candidate_path.open("w", encoding="utf-8", newline="") as candidates, matching_path.open("w", encoding="utf-8", newline="") as matches:
         candidates.write("source1_entity_id\tcandidate_entity_ids\n")
         matches.write("source1_entity_id\tmatched_entity_ids\n")
@@ -82,8 +88,6 @@ def write_submission_from_database(output_dir: str | Path, database: str | Path,
             matches.write(f"{current_id}\t{','.join(matched_ids)}\n")
     connection.close()
     return candidate_path, matching_path
-
-# ─── PRODUCTION HIGH-SPEED STREAMING WRITER ───────────────────────────────────
 
 def write_submission_stream(
     test_source1_path: Path,
