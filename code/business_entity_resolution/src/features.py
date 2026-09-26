@@ -1,22 +1,14 @@
-"""Batched, highly vectorized lexical and structural features for candidate pairs."""
+"""Batched lexical, structured-address, retrieval and reciprocal-rank features."""
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 from rapidfuzz import fuzz, process
-from sklearn.feature_extraction.text import HashingVectorizer
 from scipy import sparse as sp
+from sklearn.feature_extraction.text import HashingVectorizer
 
-from .data import Record
-from .preprocessing import (
-    core_name,
-    extract_acronym,
-    extract_address_numbers,
-    extract_postal_code,
-    normalize_address,
-    normalize_name,
-)
+from .preprocessing import extract_acronym, extract_address_numbers, extract_postal_code, normalize_address, normalize_name
 
 FEATURE_NAMES = [
     # Exact (4)
@@ -44,12 +36,23 @@ FEATURE_NAMES = [
     "legal_suffix_agree", "legal_suffix_conflict",
     # Missingness (4)
     "name_missing_left", "name_missing_right", "address_missing_left", "address_missing_right",
+    # Structured address (8)
+    "street_number_match", "street_number_conflict",
+    "street_ratio", "street_token_set_ratio",
+    "city_ratio", "city_token_set_ratio",
+    "city_exact", "postal_missing_either",
+    # Reciprocal / cross-field ranking (6)
+    "name_rank_score", "address_rank_score", "name_address_rank_agreement",
+    "reverse_similarity_rank_score", "mutual_best", "source2_indicator",
+    "source3_indicator",
 ]
 
 _CHAR_TRIGRAMS = HashingVectorizer(
     analyzer="char_wb", ngram_range=(3, 3), n_features=2 ** 14,
     alternate_sign=False, norm=None, dtype=np.float32,
 )
+_HASH_CACHE: dict[str, tuple[object, np.float32]] = {}
+_HASH_CACHE_LIMIT = 50_000
 
 
 def _tokens(value: str) -> set[str]:
@@ -76,16 +79,14 @@ def _containment_scores(left: Sequence[str], right: Sequence[str]) -> np.ndarray
     return containment
 
 
-_HASH_CACHE = {}
-
 def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     global _HASH_CACHE
-    while len(_HASH_CACHE) > 50_000:
+    while len(_HASH_CACHE) > _HASH_CACHE_LIMIT:
         _HASH_CACHE.pop(next(iter(_HASH_CACHE)))
 
     def _get(strings: Sequence[str]) -> tuple[list, np.ndarray]:
-        missing_idx = []
-        missing_str = []
+        missing_idx: list[int] = []
+        missing_str: list[str] = []
         mats = [None] * len(strings)
         norms = np.zeros(len(strings), dtype=np.float32)
         for i, s in enumerate(strings):
@@ -106,22 +107,11 @@ def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
 
     l_mats, l_norms = _get(left)
     r_mats, r_norms = _get(right)
-    
-    # Stack sparse rows and compute all row-wise dot products in one
-    # sparse operation. This removes a Python loop over every pair.
     left_matrix = sp.vstack(l_mats, format="csr")
     right_matrix = sp.vstack(r_mats, format="csr")
-    numerator = np.asarray(
-        left_matrix.multiply(right_matrix).sum(axis=1)
-    ).ravel().astype(np.float32, copy=False)
-
+    numerator = np.asarray(left_matrix.multiply(right_matrix).sum(axis=1)).ravel().astype(np.float32, copy=False)
     denom = l_norms * r_norms
-    return np.divide(
-        numerator,
-        denom,
-        out=np.zeros(len(left), dtype=np.float32),
-        where=denom > 0,
-    )
+    return np.divide(numerator, denom, out=np.zeros(len(left), dtype=np.float32), where=denom > 0)
 
 
 def _number_scores(left: Sequence[str], right: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -158,8 +148,47 @@ def _acronym_matches(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     return matches
 
 
+def _safe_optional_columns(columns: list[tuple], n: int) -> tuple[list[str], ...]:
+    """Read advanced columns while preserving compatibility with old test rows."""
+    if len(columns) >= 29:
+        s_num = columns[17]
+        s_street = columns[18]
+        s_city = columns[19]
+        s_postal = columns[20]
+        t_num = columns[21]
+        t_street = columns[22]
+        t_city = columns[23]
+        t_postal = columns[24]
+        name_rank = columns[25]
+        address_rank = columns[26]
+        reverse_rank = columns[27]
+        mutual_best = columns[28]
+        rank_agreement = columns[29]
+        return (
+            list(s_num), list(s_street), list(s_city), list(s_postal),
+            list(t_num), list(t_street), list(t_city), list(t_postal),
+            list(name_rank), list(address_rank), list(reverse_rank),
+            list(mutual_best), list(rank_agreement),
+        )
+
+    blanks = [""] * n
+    zeros = [0.0] * n
+    neutral_rank = [1.0] * n
+    neutral_agreement = [1.0] * n
+    return (
+        blanks.copy(), blanks.copy(), blanks.copy(), blanks.copy(),
+        blanks.copy(), blanks.copy(), blanks.copy(), blanks.copy(),
+        neutral_rank.copy(), neutral_rank.copy(), neutral_rank.copy(),
+        zeros.copy(), neutral_agreement.copy(),
+    )
+
+
 def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
-    """Vectorize a batch of DB rows using multithreaded RapidFuzz and NumPy."""
+    """Vectorize a batch of candidate rows.
+
+    ``rows`` may be the legacy 17-column candidate representation used by older
+    tests or the current richer representation produced by ``BlockingStore``.
+    """
     if not rows:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
 
@@ -167,6 +196,12 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     s_country, s_name, s_core, s_sorted, s_address, s_numbers = columns[2:8]
     t_country, t_name, t_core, t_sorted, t_address, t_numbers = columns[8:14]
     evidence, similarity, rank = columns[14:17]
+    (
+        s_num, s_street, s_city, s_postal,
+        t_num, t_street, t_city, t_postal,
+        name_rank, address_rank, reverse_rank,
+        mutual_best, rank_agreement,
+    ) = _safe_optional_columns(columns, len(rows))
 
     name_ratio = process.cpdist(s_name, t_name, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
     core_ratio = process.cpdist(s_core, t_core, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
@@ -183,9 +218,17 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
     name_containment = _containment_scores(s_core, t_core)
     address_containment = _containment_scores(s_address, t_address)
     acronym_match = _acronym_matches(s_core, t_core)
-
     number_jaccard, first_number_match = _number_scores(s_numbers, t_numbers)
     postal_match, postal_conflict = _postal_scores(s_address, t_address)
+
+    street_ratio = process.cpdist(s_street, t_street, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    street_token_set = process.cpdist(s_street, t_street, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    city_ratio = process.cpdist(s_city, t_city, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    city_token_set = process.cpdist(s_city, t_city, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1).astype(np.float32) / 100.0
+    street_number_match = np.asarray([bool(a) and bool(b) and a == b for a, b in zip(s_num, t_num)], dtype=np.float32)
+    street_number_conflict = np.asarray([bool(a) and bool(b) and a != b for a, b in zip(s_num, t_num)], dtype=np.float32)
+    city_exact = np.asarray([bool(a) and bool(b) and a == b for a, b in zip(s_city, t_city)], dtype=np.float32)
+    postal_missing_either = np.asarray([not a or not b for a, b in zip(s_postal, t_postal)], dtype=np.float32)
 
     s_name_len = np.asarray([len(v) for v in s_name], dtype=np.float32)
     t_name_len = np.asarray([len(v) for v in t_name], dtype=np.float32)
@@ -194,6 +237,10 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
 
     s_suffix = [n[len(c):].strip() if c and n.startswith(c) else (n.replace(c, "", 1).strip() if c else "") for n, c in zip(s_name, s_core)]
     t_suffix = [n[len(c):].strip() if c and n.startswith(c) else (n.replace(c, "", 1).strip() if c else "") for n, c in zip(t_name, t_core)]
+
+    name_rank_score = 1.0 / np.maximum(np.asarray(name_rank, dtype=np.float32), 1.0)
+    address_rank_score = 1.0 / np.maximum(np.asarray(address_rank, dtype=np.float32), 1.0)
+    reverse_rank_score = 1.0 / np.maximum(np.asarray(reverse_rank, dtype=np.float32), 1.0)
 
     return np.column_stack((
         # Exact
@@ -235,4 +282,15 @@ def feature_batch(rows: Sequence[tuple]) -> np.ndarray:
         np.asarray([not a for a in t_name], dtype=np.float32),
         np.asarray([not a for a in s_address], dtype=np.float32),
         np.asarray([not a for a in t_address], dtype=np.float32),
+        # Structured address
+        street_number_match, street_number_conflict,
+        street_ratio, street_token_set,
+        city_ratio, city_token_set, city_exact, postal_missing_either,
+        # Reciprocal / cross-field ranking
+        name_rank_score, address_rank_score,
+        np.asarray(rank_agreement, dtype=np.float32),
+        reverse_rank_score,
+        np.asarray(mutual_best, dtype=np.float32),
+        np.asarray([float(tid.startswith("S2-")) for tid in columns[1]], dtype=np.float32),
+        np.asarray([float(tid.startswith("S3-")) for tid in columns[1]], dtype=np.float32),
     )).astype(np.float32, copy=False)

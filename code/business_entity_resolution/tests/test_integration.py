@@ -78,7 +78,7 @@ class TestMissingRequirements(unittest.TestCase):
 
     def test_integration_pipeline_metrics(self):
         """One synthetic end-to-end integration test with hand-computed F0.5."""
-        from src.pipeline import _build_store, _materialize, _fast_tune_threshold
+        from src.pipeline import _build_store, _materialize, _grouped_f05, BASELINE_THRESHOLD
         
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -124,11 +124,9 @@ class TestMissingRequirements(unittest.TestCase):
                     else:
                         probs[i] = 0.1
             
-            # Predict pairs via the store and check optimal threshold
-            sql_score, best_thresh = _fast_tune_threshold(store, fit, probs, "1=1", ())
-            
-            # The model should be able to separate the easy matches from negatives,
-            # so at the optimal threshold, the macro F0.5 should be 1.0
+            # The deterministic baseline threshold should separate this synthetic
+            # example perfectly, including the singleton with no true match.
+            sql_score, _ = _grouped_f05(store, fit, probs, BASELINE_THRESHOLD, "1=1", ())
             self.assertEqual(sql_score, 1.0)
             
             store.close()

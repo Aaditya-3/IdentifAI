@@ -282,3 +282,94 @@ def write_submission_stream(
 
     LOGGER.info("Streamed %d Source 1 records directly to %s and %s", len(s1_order), candidate_path.name, matching_path.name)
     return candidate_path, matching_path
+
+def validate_output_against_store(
+    store,
+    candidate_path: str | Path,
+    matching_path: str | Path,
+) -> None:
+    """Validate submission files in a single streaming pass.
+
+    The official challenge validator remains the final submission gate. This local
+    check deliberately avoids loading millions of S1/candidate rows into memory.
+    """
+    candidate_path = Path(candidate_path)
+    matching_path = Path(matching_path)
+    expected_cursor = iter(store.connection.execute("SELECT entity_id FROM source1 ORDER BY entity_id"))
+    expected_count = store.connection.execute("SELECT COUNT(*) FROM source1").fetchone()[0]
+
+    def _next_line(handle, expected_header: str, path: Path, first: bool = False):
+        line = handle.readline()
+        if first:
+            if line.rstrip("\n") != expected_header:
+                raise AssertionError(f"{path} has invalid header")
+            return None
+        if not line:
+            return None
+        s1, sep, values = line.rstrip("\n").partition("\t")
+        if not sep or not s1:
+            raise AssertionError(f"Malformed row in {path}: {line.rstrip()!r}")
+        ids = [value for value in values.split(",") if value]
+        if len(ids) != len(set(ids)):
+            raise AssertionError(f"Duplicate target IDs in {path} for {s1}")
+        return s1, ids
+
+    candidate_total = 0
+    match_total = 0
+    previous_sid = None
+
+    with candidate_path.open("r", encoding="utf-8", newline="") as fc, matching_path.open("r", encoding="utf-8", newline="") as fm:
+        _next_line(fc, "source1_entity_id\tcandidate_entity_ids", candidate_path, first=True)
+        _next_line(fm, "source1_entity_id\tmatched_entity_ids", matching_path, first=True)
+
+        for row_index in range(expected_count):
+            expected = next(expected_cursor, None)
+            if expected is None:
+                raise AssertionError("Output contains more Source-1 rows than the store")
+            expected_sid = expected[0]
+            candidate = _next_line(fc, "", candidate_path)
+            match = _next_line(fm, "", matching_path)
+            if candidate is None or match is None:
+                raise AssertionError(f"Output ended early at expected Source-1 row {row_index + 1}")
+            candidate_sid, candidate_ids = candidate
+            match_sid, match_ids = match
+            if candidate_sid != expected_sid or match_sid != expected_sid:
+                raise AssertionError(
+                    f"Source-1 row order mismatch at row {row_index + 1}: "
+                    f"expected {expected_sid}, got {candidate_sid}/{match_sid}"
+                )
+            if previous_sid is not None and expected_sid <= previous_sid:
+                raise AssertionError("Source-1 IDs are not strictly increasing")
+            previous_sid = expected_sid
+            candidate_set = set(candidate_ids)
+            for target_id in candidate_ids:
+                if not target_id.startswith(("S2-", "S3-")):
+                    raise AssertionError(f"Illegal candidate target {target_id} for {expected_sid}")
+            for target_id in match_ids:
+                if not target_id.startswith(("S2-", "S3-")):
+                    raise AssertionError(f"Illegal match target {target_id} for {expected_sid}")
+            unexpected = set(match_ids) - candidate_set
+            if unexpected:
+                raise AssertionError(
+                    f"Matches outside candidate set for {expected_sid}: {sorted(unexpected)[:5]}"
+                )
+            candidate_total += len(candidate_ids)
+            match_total += len(match_ids)
+
+        if _next_line(fc, "", candidate_path) is not None:
+            raise AssertionError("candidate_pairs.tsv contains extra Source-1 rows")
+        if _next_line(fm, "", matching_path) is not None:
+            raise AssertionError("matching_results.tsv contains extra Source-1 rows")
+
+    target_count = store.connection.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+    if target_count <= 0:
+        raise AssertionError("Target store is empty; cannot produce a valid submission")
+
+    LOGGER.info(
+        "Submission contract validation PASS: %d S1 rows, %d candidates, %d matches, %d targets",
+        expected_count,
+        candidate_total,
+        match_total,
+        target_count,
+    )
+

@@ -6,12 +6,14 @@ Changes from prior version:
   high-frequency keys are discarded entirely (they are not selective).
 - Fixed cheap ranking score to properly balance name vs address signals.
 - Added complete-match-set recall diagnostics.
-- Widened shortlist window before scoring and raised the final recall budget.
+- Replaced fixed candidate padding with an adaptive, evidence-aware final cap.
+- Keeps the recall-first raw reservoir while avoiding repeated SQLite window sorts.
 """
 from __future__ import annotations
 
 import csv
 import hashlib
+import heapq
 import logging
 import sqlite3
 import time
@@ -32,15 +34,21 @@ from .preprocessing import (
     extract_address_numbers,
     normalize_address,
     normalize_name,
+    parse_address_components,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 
 class BlockingStore:
-    # 96 keeps the candidate budget modest while materially reducing
-    # true-match loss at the final pruning boundary observed on the 5k benchmark.
-    TOP_K = 96
+    # One production source of truth for the hard candidate cap.
+    # The final candidate set is adaptive and may be much smaller than TOP_K.
+    TOP_K = 64
+    SHORTLIST_MULTIPLIER = 8
+    MIN_FINAL_CANDIDATES = 4
+    AMBIGUOUS_MIN_FINAL_CANDIDATES = 12
+    FINAL_SCORE_FLOOR = 0.55
+    FINAL_SCORE_MARGIN = 0.20
     MINHASH_PERMUTATIONS = 32
     MINHASH_BANDS = 16  # r=2 rows/band -> 99.0% recall on 0.5 Jaccard overlap
     TOKEN_DF_LIMIT = 5_000
@@ -92,12 +100,14 @@ class BlockingStore:
             CREATE TABLE source1 (
                 entity_id TEXT PRIMARY KEY, country TEXT NOT NULL, name TEXT NOT NULL,
                 core TEXT NOT NULL, sorted_core TEXT NOT NULL, address TEXT NOT NULL,
-                numbers TEXT NOT NULL, split INTEGER NOT NULL
+                numbers TEXT NOT NULL, street_number TEXT NOT NULL, street TEXT NOT NULL,
+                city TEXT NOT NULL, postal_code TEXT NOT NULL, split INTEGER NOT NULL
             );
             CREATE TABLE targets (
                 entity_id TEXT PRIMARY KEY, country TEXT NOT NULL, name TEXT NOT NULL,
                 core TEXT NOT NULL, sorted_core TEXT NOT NULL, address TEXT NOT NULL,
-                numbers TEXT NOT NULL
+                numbers TEXT NOT NULL, street_number TEXT NOT NULL, street TEXT NOT NULL,
+                city TEXT NOT NULL, postal_code TEXT NOT NULL
             );
             CREATE TABLE token_df (token TEXT PRIMARY KEY, frequency INTEGER NOT NULL);
             CREATE TABLE block_keys (key TEXT NOT NULL, entity_id TEXT NOT NULL, weight REAL NOT NULL);
@@ -125,13 +135,17 @@ class BlockingStore:
             yield from csv.DictReader(stream, delimiter="\t")
 
     @staticmethod
-    def _derived(row: Mapping[str, str]) -> tuple[str, str, str, str, str, str]:
+    def _derived(row: Mapping[str, str]):
         country = (row.get("country") or "").strip().casefold()
         name = normalize_name(row.get("business_name", ""))
         core = core_name(row.get("business_name", ""))
         sorted_core = " ".join(sorted(core.split()))
-        address = normalize_address(row.get("business_address", ""))
-        return country, name, core, sorted_core, address, extract_address_numbers(address)
+        components = parse_address_components(row.get("business_address", ""))
+        address = components.normalized
+        return (
+            country, name, core, sorted_core, address, extract_address_numbers(address),
+            components.street_number, components.street, components.city, components.postal_code,
+        )
 
     @staticmethod
     def _stable_split(entity_id: str) -> int:
@@ -286,17 +300,17 @@ class BlockingStore:
             entity_id = (row.get("entity_id") or "").strip()
             if not entity_id:
                 continue
-            country, name, core, sorted_core, address, numbers = self._derived(row)
-            records.append((entity_id, country, name, core, sorted_core, address, numbers, self._stable_split(entity_id)))
+            (country, name, core, sorted_core, address, numbers, street_number, street, city, postal_code) = self._derived(row)
+            records.append((entity_id, country, name, core, sorted_core, address, numbers, street_number, street, city, postal_code, self._stable_split(entity_id)))
             rare_tokens = self._rare_tokens(core)
             keys.extend((key, entity_id, weight) for key, weight in self._keys(country, name, core, sorted_core, address, numbers, rare_tokens))
             count += 1
             if count % 20_000 == 0:
-                self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)", records)
+                self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
                 self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?)", keys)
                 records.clear(); keys.clear(); self.connection.commit()
         if records:
-            self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)", records)
+            self.connection.executemany("INSERT INTO source1 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", records)
             self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?)", keys)
         self.connection.execute("CREATE INDEX block_keys_key ON block_keys(key, entity_id)")
         self.connection.commit()
@@ -369,8 +383,8 @@ class BlockingStore:
                 entity_id = (row.get("entity_id") or "").strip()
                 if not entity_id:
                     continue
-                country, name, core, sorted_core, address, numbers = self._derived(row)
-                target_rows.append((entity_id, country, name, core, sorted_core, address, numbers))
+                (country, name, core, sorted_core, address, numbers, street_number, street, city, postal_code) = self._derived(row)
+                target_rows.append((entity_id, country, name, core, sorted_core, address, numbers, street_number, street, city, postal_code))
 
                 rare_tokens = self._rare_tokens(core)
                 keys_for_target = self._keys(
@@ -408,11 +422,11 @@ class BlockingStore:
                 )
                 count += 1
                 if count % 20_000 == 0:
-                    self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?)", target_rows)
+                    self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", target_rows)
                     self.connection.executemany("INSERT INTO all_target_keys VALUES (?, ?, ?)", key_rows)
                     target_rows.clear(); key_rows.clear(); self.connection.commit()
             if target_rows:
-                self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?)", target_rows)
+                self.connection.executemany("INSERT OR REPLACE INTO targets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", target_rows)
                 self.connection.executemany("INSERT INTO all_target_keys VALUES (?, ?, ?)", key_rows)
             self.connection.commit()
             LOGGER.info("Retrieved target blocks from %s (%d targets)", Path(path).name, count)
@@ -636,534 +650,423 @@ class BlockingStore:
         LOGGER.info("High-frequency rescue added %d bounded candidate rows", rescued_pairs)
 
     def finalize_candidates(self) -> int:
+        """Build final candidates with a recall-first, low-I/O pruning path.
+
+        The old implementation used several SQLite window functions over the
+        entire raw candidate table.  On the real benchmark that meant repeatedly
+        sorting millions of rows and writing large temporary tables to disk.
+
+        This version keeps the same raw blocking stage, but performs pruning in
+        one ordered pass over ``raw_candidates``:
+
+        1. Gather one Source-1 entity's raw candidates.
+        2. Reserve candidates from independent evidence families.
+        3. Add top name/address lexical retrieval candidates from the raw block.
+        4. Score only the bounded shortlist with RapidFuzz.
+        5. Select at most TOP_K final candidates in memory.
+
+        This preserves multiple retrieval routes while avoiding the large
+        SQLite window-sort / scored_candidates / selected_candidates pipeline.
+        """
         diagnostics: dict = {}
         has_truth = self._has_truth()
 
         if has_truth:
             raw_r, raw_hit, raw_tot = self._recall_on_table("raw_candidates")
-            diagnostics["raw_blocking"] = {"recall": raw_r, "retrieved": raw_hit, "total": raw_tot}
-            cms_r = self._complete_match_set_recall("raw_candidates")
-            diagnostics["raw_blocking"]["complete_match_set_recall"] = cms_r
+            diagnostics["raw_blocking"] = {
+                "recall": raw_r,
+                "retrieved": raw_hit,
+                "total": raw_tot,
+                "complete_match_set_recall": self._complete_match_set_recall("raw_candidates"),
+                "by_country": self._country_diagnostics("raw_candidates"),
+            }
         raw_stats = self._candidate_stats("raw_candidates")
         diagnostics["raw_stats"] = raw_stats
 
-        # Recall-first diversified shortlist.
-        #
-        # The previous implementation selected only the highest aggregate
-        # blocking-evidence candidates. On the real 5k benchmark that caused:
-        #
-        #   99.13% complete-match recall at raw blocking
-        #   -> 74.71% after shortlist
-        #
-        # The problem was not raw blocking; it was allowing one evidence type
-        # to consume the shortlist quota. We keep the same overall shortlist
-        # budget (8 * TOP_K) but reserve deterministic slots for:
-        #
-        #   256 global evidence
-        #    96 strong/exact evidence
-        #   160 name evidence (including LSH/prefix)
-        #   160 address evidence (including address-LSH)
-        #    96 structural evidence
-        # for TOP_K=96; all routes share a single 8*TOP_K budget.
-        #
-        # These routes are unioned, so duplicates do not increase the actual
-        # shortlist size. This preserves diverse retrieval paths without
-        # multiplying the candidate volume beyond the previous 8K budget.
+        # For TOP_K=64 this creates at most 512 shortlist rows per S1.
+        # Allocation is intentionally diversified and includes independent
+        # lexical retrieval paths so sparse blocking evidence cannot eliminate a
+        # candidate before stronger name/address similarity is evaluated.
+        shortlist_budget = max(1, self.top_k * self.SHORTLIST_MULTIPLIER)
+        global_quota = max(1, self.top_k + self.top_k // 2)
+        exact_quota = max(1, self.top_k)
+        name_quota = max(1, self.top_k)
+        address_quota = max(1, self.top_k)
+        structural_quota = max(1, self.top_k // 2)
+        lexical_name_quota = max(1, self.top_k + self.top_k // 2)
+        lexical_address_quota = max(1, self.top_k + self.top_k // 2)
 
-        # Recall-first allocation for the 8x shortlist budget.  The previous
-        # 4K + K + K + K + K layout over-reserved the global evidence route.
-        # That made it easier for large evidence-heavy blocks to crowd out
-        # candidates that had stronger lexical name/address support.
-        #
-        # For TOP_K=96 this becomes:
-        #   global      256
-        #   strong       96
-        #   name        160
-        #   address     160
-        #   structural   96
-        #   total       768
-        #
-        # The final fill still caps the actual shortlist at 8 * TOP_K.
-        shortlist_global = max(1, self.top_k * 8 // 3)
-        shortlist_strong = max(1, self.top_k)
-        shortlist_name = max(1, self.top_k * 5 // 3)
-        shortlist_address = max(1, self.top_k * 5 // 3)
-        shortlist_structural = max(1, self.top_k)
-
-        self.connection.execute("""
-            CREATE TABLE shortlist AS
-            WITH ranked AS (
-                SELECT
-                    source1_id,
-                    target_id,
-                    evidence,
-                    support_count,
-                    name_evidence,
-                    address_evidence,
-                    structural_evidence,
-                    exact_evidence,
-
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id
-                        ORDER BY evidence DESC, support_count DESC, target_id
-                    ) AS global_pos,
-
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id
-                        ORDER BY exact_evidence DESC,
-                                 evidence DESC,
-                                 support_count DESC,
-                                 target_id
-                    ) AS strong_pos,
-
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id
-                        ORDER BY name_evidence DESC,
-                                 evidence DESC,
-                                 support_count DESC,
-                                 target_id
-                    ) AS name_pos,
-
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id
-                        ORDER BY address_evidence DESC,
-                                 evidence DESC,
-                                 support_count DESC,
-                                 target_id
-                    ) AS address_pos,
-
-                    ROW_NUMBER() OVER (
-                        PARTITION BY source1_id
-                        ORDER BY structural_evidence DESC,
-                                 support_count DESC,
-                                 evidence DESC,
-                                 target_id
-                    ) AS structural_pos
-
-                FROM raw_candidates
-            ),
-            selected AS (
-                SELECT source1_id, target_id
-                FROM ranked
-                WHERE global_pos <= ?
-                   OR strong_pos <= ?
-                   OR name_pos <= ?
-                   OR address_pos <= ?
-                   OR structural_pos <= ?
-            )
-            SELECT
-                r.source1_id,
-                r.target_id,
-                COALESCE(
-                    (r.evidence - MIN(r.evidence) OVER (PARTITION BY r.source1_id)) /
-                    NULLIF(
-                        MAX(r.evidence) OVER (PARTITION BY r.source1_id) -
-                        MIN(r.evidence) OVER (PARTITION BY r.source1_id),
-                        0
-                    ),
-                    1.0
-                ) AS evidence,
-                r.support_count,
-                r.name_evidence,
-                r.address_evidence,
-                r.structural_evidence,
-                r.exact_evidence
-            FROM ranked r
-            JOIN (
-                SELECT DISTINCT source1_id, target_id
-                FROM selected
-            ) s
-              ON s.source1_id = r.source1_id
-             AND s.target_id = r.target_id
-        """, (
-            shortlist_global,
-            shortlist_strong,
-            shortlist_name,
-            shortlist_address,
-            shortlist_structural,
-        ))
-
-        # Fill the unused shortlist budget from the remaining globally strongest
-        # raw candidates.  The diversified quota routes above can overlap heavily
-        # (for example, an exact name+address candidate may appear in every
-        # family), which previously caused the actual shortlist to collapse to
-        # ~200 candidates/entity despite a 512-candidate budget.  That overlap
-        # was a major source of recall loss on the real-data benchmark.
-        #
-        # Important: this fill is still bounded by the same 8 * TOP_K budget.
-        # We are not increasing the worst-case shortlist size; we are using the
-        # budget that was already allocated.
-        # The shortlist was created with CREATE TABLE AS, so it has no implicit
-        # primary-key/index structure.  The fill stage performs a NOT EXISTS
-        # lookup per raw candidate; indexing (source1_id, target_id) is therefore
-        # essential to keep this recall-safety pass bounded on large blocks.
-        self.connection.execute(
-            "CREATE UNIQUE INDEX shortlist_sid_tid ON shortlist(source1_id, target_id)"
+        reserved_total = (
+            global_quota
+            + exact_quota
+            + name_quota
+            + address_quota
+            + structural_quota
+            + lexical_name_quota
+            + lexical_address_quota
         )
-        self.connection.commit()
+        if reserved_total > shortlist_budget:
+            raise AssertionError(
+                f"Shortlist allocation exceeds budget: reserved={reserved_total}, budget={shortlist_budget}"
+            )
 
-        raw_bounds_sql = """
-            WITH bounds AS (
-                SELECT source1_id, MIN(evidence) AS min_ev, MAX(evidence) AS max_ev
-                FROM raw_candidates
-                GROUP BY source1_id
-            ),
-            chosen AS (
-                SELECT source1_id, COUNT(*) AS chosen_count
-                FROM shortlist
-                GROUP BY source1_id
-            ),
-            remaining_ranked AS (
-                SELECT
-                    r.source1_id, r.target_id, r.support_count,
-                    r.name_evidence, r.address_evidence,
-                    r.structural_evidence, r.exact_evidence,
-                    r.evidence,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY r.source1_id
-                        ORDER BY r.evidence DESC, r.support_count DESC, r.target_id
-                    ) AS pos
-                FROM raw_candidates r
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM shortlist s
-                    WHERE s.source1_id = r.source1_id
-                      AND s.target_id = r.target_id
-                )
-            )
-            INSERT INTO shortlist(
-                source1_id, target_id, evidence, support_count,
-                name_evidence, address_evidence,
-                structural_evidence, exact_evidence
-            )
-            SELECT
-                r.source1_id,
-                r.target_id,
-                CASE
-                    WHEN b.max_ev > b.min_ev
-                    THEN (r.evidence - b.min_ev) / (b.max_ev - b.min_ev)
-                    ELSE 1.0
-                END AS evidence,
-                r.support_count,
-                r.name_evidence,
-                r.address_evidence,
-                r.structural_evidence,
-                r.exact_evidence
-            FROM remaining_ranked r
-            JOIN bounds b ON b.source1_id = r.source1_id
-            LEFT JOIN chosen c ON c.source1_id = r.source1_id
-            WHERE r.pos <= CASE
-                WHEN ? - COALESCE(c.chosen_count, 0) > 0
-                THEN ? - COALESCE(c.chosen_count, 0)
-                ELSE 0
-            END
-        """
-        shortlist_budget = max(1, self.top_k * 8)
-        self.connection.execute(raw_bounds_sql, (shortlist_budget, shortlist_budget))
-        self.connection.commit()
+        # Truth is consumed as an ordered stream only when diagnostics are
+        # available. This avoids materializing the full ground-truth mapping in
+        # Python while still measuring shortlist/final recall precisely.
+        truth_iter = None
+        truth_current = None
+        truth_total_pairs = 0
+        truth_total_s1 = 0
+        shortlist_hit_pairs = 0
+        final_hit_pairs = 0
+        shortlist_complete_s1 = 0
+        final_complete_s1 = 0
 
         if has_truth:
-            sl_r, sl_hit, sl_tot = self._recall_on_table("shortlist")
-            diagnostics["shortlist"] = {"recall": sl_r, "retrieved": sl_hit, "total": sl_tot}
-            diagnostics["shortlist"]["complete_match_set_recall"] = self._complete_match_set_recall("shortlist")
-        diagnostics["shortlist_stats"] = self._candidate_stats("shortlist")
+            truth_total_pairs = int(self.connection.execute("SELECT COUNT(*) FROM truth").fetchone()[0])
+            truth_total_s1 = int(self.connection.execute("SELECT COUNT(DISTINCT source1_id) FROM truth").fetchone()[0])
+            truth_iter = iter(self.connection.execute(
+                "SELECT source1_id, target_id FROM truth ORDER BY source1_id, target_id"
+            ))
+            truth_current = next(truth_iter, None)
 
-        self.connection.execute("""
-            CREATE TABLE scored_candidates (
-                source1_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                evidence REAL NOT NULL,
-                similarity REAL NOT NULL,
-                name_score REAL NOT NULL,
-                address_score REAL NOT NULL,
-                structural_signal REAL NOT NULL,
-                exact_signal REAL NOT NULL
-            );
-        """)
-        reader = self.connection.execute("""
-            SELECT
-                c.source1_id,
-                c.target_id,
-                s.core,
-                s.address,
-                t.core,
-                t.address,
-                c.evidence,
-                c.support_count,
-                c.structural_evidence,
-                c.exact_evidence
-            FROM shortlist c
-            JOIN source1 s ON s.entity_id=c.source1_id
-            JOIN targets t ON t.entity_id=c.target_id
-        """)
-        scored_batch = []
-        while True:
-            rows = reader.fetchmany(50_000)
-            if not rows:
-                break
-            s_cores = [r[2] for r in rows]
-            t_cores = [r[4] for r in rows]
-            s_addrs = [r[3] for r in rows]
-            t_addrs = [r[5] for r in rows]
+        def _truth_for_sid(sid: str) -> set[str]:
+            nonlocal truth_current
+            if truth_iter is None:
+                return set()
+            while truth_current is not None and truth_current[0] < sid:
+                # This S1 has no raw candidate group, so it contributes no hits.
+                truth_current = next(truth_iter, None)
+            if truth_current is None or truth_current[0] != sid:
+                return set()
+            result: set[str] = set()
+            while truth_current is not None and truth_current[0] == sid:
+                result.add(truth_current[1])
+                truth_current = next(truth_iter, None)
+            return result
 
-            name_ratio = process.cpdist(s_cores, t_cores, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
-            name_set = process.cpdist(s_cores, t_cores, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
-            name_scores = np.maximum(name_ratio, name_set).astype(np.float32) / 100.0
-            addr_ratio = process.cpdist(s_addrs, t_addrs, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
-            addr_set = process.cpdist(s_addrs, t_addrs, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
-            addr_scores = np.maximum(addr_ratio, addr_set).astype(np.float32) / 100.0
-
-            for row, n_s, a_s in zip(rows, name_scores, addr_scores):
-                sid, tid = row[0], row[1]
-                ev = float(row[6])
-                support_count = int(row[7])
-                structural_evidence = float(row[8])
-                exact_evidence = float(row[9])
-
-                # Retrieval signals are already normalized enough for routing;
-                # cap them before mixing so repeated blocking keys cannot dominate
-                # lexical similarity.
-                support_signal = min(support_count, 4) / 4.0
-                structural_signal = 1.0 if structural_evidence > 0 else 0.0
-                exact_signal = 1.0 if exact_evidence > 0 else 0.0
-
-                # The classifier itself gets the full 43-feature representation.
-                # This cheap score is ONLY for candidate ordering, so it should
-                # be conservative and modality-balanced rather than acting like
-                # a final matcher.
-                # Candidate ordering is deliberately recall-oriented.  The
-                # learned model later receives the full 43-feature vector; this
-                # score only decides which candidates survive the final cap.
-                # Give independent name/address agreement more weight than the
-                # number of blocking keys so a true match with sparse blocking
-                # evidence is not discarded just because it matched fewer keys.
-                sim = (
-                    0.39 * float(n_s)
-                    + 0.39 * float(a_s)
-                    + 0.12 * float(ev)
-                    + 0.05 * exact_signal
-                    + 0.05 * max(structural_signal, support_signal)
-                )
-
-                scored_batch.append((
-                    sid,
-                    tid,
-                    float(ev),
-                    float(sim),
-                    float(n_s),
-                    float(a_s),
-                    float(max(structural_signal, support_signal)),
-                    float(exact_signal),
-                ))
-
-            if len(scored_batch) >= 100_000:
-                self.connection.executemany(
-                    """INSERT INTO scored_candidates(
-                           source1_id, target_id, evidence, similarity,
-                           name_score, address_score, structural_signal, exact_signal
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    scored_batch,
-                )
-                scored_batch.clear(); self.connection.commit()
-        if scored_batch:
-            self.connection.executemany(
-                """INSERT INTO scored_candidates(
-                       source1_id, target_id, evidence, similarity,
-                       name_score, address_score, structural_signal, exact_signal
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                scored_batch,
-            )
-            self.connection.commit()
-
-        # Diversified final selection with guaranteed budget fill.
-        #
-        # Important correctness property:
-        # A diversity quota is a RESERVATION, not a hard reduction of the
-        # final budget.  If several quota lists overlap heavily (e.g. 300
-        # identical true targets with identical name/address scores), the
-        # unused slots MUST be filled with the next global candidates.
-        # Otherwise TOP_K=300 could incorrectly return only 150 rows.
-        self.connection.execute("""
-            CREATE TABLE selected_candidates (
-                source1_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                stage INTEGER NOT NULL,
-                PRIMARY KEY (source1_id, target_id)
-            ) WITHOUT ROWID;
-        """)
-
-        if self.top_k < 8:
-            overall_quota = self.top_k
-            family_quota = 0
-        else:
-            # 50% overall + 12.5% for each of four complementary retrieval
-            # families. Integer rounding may leave a few slots unused; the
-            # fill stage below deterministically consumes remaining capacity.
-            overall_quota = max(1, self.top_k // 2)
-            family_quota = max(1, self.top_k // 8)
-
-        def _add_stage(order_sql: str, quota: int, stage: int) -> None:
-            if quota <= 0:
-                return
-            self.connection.execute(f"""
-                INSERT OR IGNORE INTO selected_candidates(source1_id, target_id, stage)
-                SELECT source1_id, target_id, {int(stage)}
-                FROM (
-                    SELECT
-                        sc.source1_id,
-                        sc.target_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY sc.source1_id
-                            ORDER BY {order_sql}
-                        ) AS pos
-                    FROM scored_candidates sc
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM selected_candidates chosen
-                        WHERE chosen.source1_id = sc.source1_id
-                          AND chosen.target_id = sc.target_id
-                    )
-                ) ranked
-                WHERE pos <= ?
-            """, (quota,))
-
-        # 1. Strongest candidates globally.
-        _add_stage(
-            "sc.similarity DESC, sc.target_id",
-            overall_quota,
-            1,
-        )
-
-        # 2. Preserve complementary retrieval families for candidates that
-        # did not make the global quota.
-        _add_stage(
-            "sc.exact_signal DESC, sc.similarity DESC, sc.target_id",
-            family_quota,
-            2,
-        )
-        _add_stage(
-            "sc.name_score DESC, sc.similarity DESC, sc.target_id",
-            family_quota,
-            3,
-        )
-        _add_stage(
-            "sc.address_score DESC, sc.similarity DESC, sc.target_id",
-            family_quota,
-            4,
-        )
-        _add_stage(
-            "sc.structural_signal DESC, sc.similarity DESC, sc.target_id",
-            family_quota,
-            5,
-        )
-
-        # 3. Fill EVERY unused slot from the remaining globally best
-        # candidates.  This is the crucial safeguard against quota overlap.
-        self.connection.execute("""
-            WITH selected_counts AS (
-                SELECT source1_id, COUNT(*) AS chosen_count
-                FROM selected_candidates
-                GROUP BY source1_id
-            ),
-            source_entities AS (
-                SELECT DISTINCT source1_id FROM scored_candidates
-            ),
-            remaining AS (
-                SELECT
-                    e.source1_id,
-                    CASE
-                        WHEN ? - COALESCE(c.chosen_count, 0) > 0
-                        THEN ? - COALESCE(c.chosen_count, 0)
-                        ELSE 0
-                    END AS slots
-                FROM source_entities e
-                LEFT JOIN selected_counts c
-                  ON c.source1_id = e.source1_id
-            ),
-            ranked_remaining AS (
-                SELECT
-                    sc.source1_id,
-                    sc.target_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY sc.source1_id
-                        ORDER BY sc.similarity DESC, sc.target_id
-                    ) AS pos
-                FROM scored_candidates sc
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM selected_candidates chosen
-                    WHERE chosen.source1_id = sc.source1_id
-                      AND chosen.target_id = sc.target_id
-                )
-            )
-            INSERT OR IGNORE INTO selected_candidates(source1_id, target_id, stage)
-            SELECT
-                r.source1_id,
-                r.target_id,
-                8
-            FROM ranked_remaining r
-            JOIN remaining rem
-              ON rem.source1_id = r.source1_id
-            WHERE r.pos <= rem.slots
-        """, (self.top_k, self.top_k))
-
+        self.connection.execute("DROP TABLE IF EXISTS final_candidates")
         self.connection.execute("""
             CREATE TABLE final_candidates (
                 source1_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
                 evidence REAL NOT NULL,
                 similarity REAL NOT NULL,
+                name_score REAL NOT NULL,
+                address_score REAL NOT NULL,
                 rank INTEGER NOT NULL,
                 PRIMARY KEY (source1_id, target_id)
             ) WITHOUT ROWID;
         """)
 
-        self.connection.execute("""
-            INSERT INTO final_candidates(
-                source1_id, target_id, evidence, similarity, rank
-            )
+        insert_buffer: list[tuple] = []
+
+        reader = self.connection.execute("""
             SELECT
-                sc.source1_id,
-                sc.target_id,
-                sc.evidence,
-                sc.similarity,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sc.source1_id
-                    ORDER BY sc.similarity DESC, sc.target_id
-                ) AS rank
-            FROM scored_candidates sc
-            JOIN selected_candidates chosen
-              ON chosen.source1_id = sc.source1_id
-             AND chosen.target_id = sc.target_id
+                r.source1_id,
+                r.target_id,
+                r.evidence,
+                r.support_count,
+                r.name_evidence,
+                r.address_evidence,
+                r.structural_evidence,
+                r.exact_evidence,
+                s.core,
+                s.address,
+                t.core,
+                t.address
+            FROM raw_candidates r
+            JOIN source1 s ON s.entity_id=r.source1_id
+            JOIN targets t ON t.entity_id=r.target_id
+            ORDER BY r.source1_id, r.target_id
         """)
 
-        max_final = self.connection.execute(
-            "SELECT COALESCE(MAX(cnt), 0) FROM (SELECT COUNT(*) AS cnt FROM final_candidates GROUP BY source1_id)"
-        ).fetchone()[0]
-        if int(max_final) > self.top_k:
-            raise AssertionError(
-                f"Final candidate invariant violated: max={max_final}, TOP_K={self.top_k}"
+        current_sid: str | None = None
+        current_rows: list[tuple] = []
+
+        def _select_and_insert(rows: list[tuple], sid: str) -> None:
+            nonlocal shortlist_hit_pairs, final_hit_pairs
+            nonlocal shortlist_complete_s1, final_complete_s1
+            if not rows:
+                return
+
+            # Raw-block evidence reservoirs. Each family gets its own bounded
+            # route. Duplicates are removed by target_id when routes overlap.
+            selected: dict[str, tuple] = {}
+
+            def _take(candidates: list[tuple], quota: int, key_fn) -> None:
+                if quota <= 0 or not candidates:
+                    return
+                for row in heapq.nlargest(quota, candidates, key=key_fn):
+                    selected[row[1]] = row
+
+            _take(rows, global_quota, lambda r: (r[2], r[3], r[1]))
+            _take(rows, exact_quota, lambda r: (r[7], r[2], r[3], r[1]))
+            _take(rows, name_quota, lambda r: (r[4], r[2], r[3], r[1]))
+            _take(rows, address_quota, lambda r: (r[5], r[2], r[3], r[1]))
+            _take(rows, structural_quota, lambda r: (r[6], r[3], r[2], r[1]))
+
+            # Independent lexical retrieval directly over the raw block is the
+            # key recall safeguard. A true match with weak blocking evidence can
+            # still enter the shortlist when its normalized name/address is very
+            # similar to the S1 record.
+            s_core = rows[0][8]
+            s_address = rows[0][9]
+            target_cores = [r[10] for r in rows]
+            target_addresses = [r[11] for r in rows]
+            target_lookup = {r[1]: r for r in rows}
+
+            if s_core:
+                for _, _, idx in process.extract(
+                    s_core,
+                    target_cores,
+                    scorer=fuzz.token_set_ratio,
+                    limit=lexical_name_quota,
+                ):
+                    row = rows[idx]
+                    selected[row[1]] = row
+            if s_address:
+                for _, _, idx in process.extract(
+                    s_address,
+                    target_addresses,
+                    scorer=fuzz.token_set_ratio,
+                    limit=lexical_address_quota,
+                ):
+                    row = rows[idx]
+                    selected[row[1]] = row
+
+            # Fill unused capacity from the strongest remaining raw candidates.
+            # The global reservoir is deliberately larger than the final budget
+            # so lexical-family overlap never reduces the actual shortlist size.
+            selected_ids = set(selected)
+            if len(selected_ids) < shortlist_budget:
+                for row in heapq.nlargest(
+                    shortlist_budget,
+                    rows,
+                    key=lambda r: (r[2], r[3], r[1]),
+                ):
+                    if row[1] not in selected_ids:
+                        selected[row[1]] = row
+                        selected_ids.add(row[1])
+                        if len(selected_ids) >= shortlist_budget:
+                            break
+
+            shortlist_rows = list(selected.values())[:shortlist_budget]
+            truth_ids = _truth_for_sid(sid) if has_truth else set()
+            shortlist_ids = {row[1] for row in shortlist_rows}
+            if truth_ids:
+                shortlist_hit_pairs += len(truth_ids & shortlist_ids)
+                if truth_ids.issubset(shortlist_ids):
+                    shortlist_complete_s1 += 1
+
+            if not shortlist_rows:
+                return
+
+            # Strong lexical scoring is now done only on the bounded shortlist.
+            n_left = [row[8] for row in shortlist_rows]
+            n_right = [row[10] for row in shortlist_rows]
+            a_left = [row[9] for row in shortlist_rows]
+            a_right = [row[11] for row in shortlist_rows]
+
+            name_ratio = process.cpdist(
+                n_left, n_right, scorer=fuzz.ratio, dtype=np.uint8, workers=-1
+            ).astype(np.float32) / 100.0
+            name_set = process.cpdist(
+                n_left, n_right, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1
+            ).astype(np.float32) / 100.0
+            name_scores = np.maximum(name_ratio, name_set)
+
+            addr_ratio = process.cpdist(
+                a_left, a_right, scorer=fuzz.ratio, dtype=np.uint8, workers=-1
+            ).astype(np.float32) / 100.0
+            addr_set = process.cpdist(
+                a_left, a_right, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1
+            ).astype(np.float32) / 100.0
+            address_scores = np.maximum(addr_ratio, addr_set)
+
+            evidence_values = [float(row[2]) for row in shortlist_rows]
+            min_ev = min(evidence_values)
+            max_ev = max(evidence_values)
+            denom = max_ev - min_ev
+
+            scored: list[tuple] = []
+            for row, n_s, a_s in zip(shortlist_rows, name_scores, address_scores):
+                ev = float(row[2])
+                ev_norm = (ev - min_ev) / denom if denom > 0 else 1.0
+                support_signal = min(int(row[3]), 4) / 4.0
+                structural_signal = 1.0 if float(row[6]) > 0 else 0.0
+                exact_signal = 1.0 if float(row[7]) > 0 else 0.0
+                sim = (
+                    0.39 * float(n_s)
+                    + 0.39 * float(a_s)
+                    + 0.12 * ev_norm
+                    + 0.05 * exact_signal
+                    + 0.05 * max(structural_signal, support_signal)
+                )
+                scored.append((
+                    row[0], row[1], ev_norm, float(sim), float(n_s), float(a_s),
+                    float(max(structural_signal, support_signal)), float(exact_signal),
+                ))
+
+            # Adaptive final selection.  The previous implementation always
+            # padded every Source-1 entity to TOP_K, which created large candidate
+            # files even for obvious singleton/easy cases.  Here TOP_K is a HARD
+            # CEILING, not a target count.
+            #
+            # We protect recall in three independent ways:
+            #   1) strong exact/modality agreements are never discarded while room exists;
+            #   2) a small per-source reserve prevents S2 or S3 from crowding out the other source;
+            #   3) the remainder is selected by an absolute/relative cheap-score floor.
+            ordered = sorted(scored, key=lambda r: (-r[3], r[1]))
+            max_keep = self.top_k
+            if len(ordered) <= max_keep:
+                chosen = ordered
+            else:
+                top_score = float(ordered[0][3])
+                if top_score >= 0.90:
+                    min_keep = self.MIN_FINAL_CANDIDATES
+                elif top_score >= 0.80:
+                    min_keep = min(self.AMBIGUOUS_MIN_FINAL_CANDIDATES, max_keep)
+                else:
+                    min_keep = min(self.AMBIGUOUS_MIN_FINAL_CANDIDATES * 2, max_keep)
+
+                score_floor = max(
+                    self.FINAL_SCORE_FLOOR,
+                    top_score - self.FINAL_SCORE_MARGIN,
+                )
+
+                chosen_by_id: dict[str, tuple] = {}
+
+                def _add(row: tuple) -> None:
+                    if len(chosen_by_id) < max_keep:
+                        chosen_by_id.setdefault(row[1], row)
+
+                # Exact retrieval evidence and very strong two-field agreement
+                # are the safest candidates to protect first.
+                for row in ordered:
+                    strong = (
+                        row[7] > 0.0
+                        or (row[4] >= 0.92 and row[5] >= 0.85)
+                        or (row[4] >= 0.95 and row[5] >= 0.70)
+                        or (row[5] >= 0.95 and row[4] >= 0.70)
+                    )
+                    if strong:
+                        _add(row)
+                        if len(chosen_by_id) >= max_keep:
+                            break
+
+                # Preserve a small number from each real target source.
+                source_quota = min(4, max(1, max_keep // 8))
+                for source_prefix in ("S2-", "S3-"):
+                    count = 0
+                    for row in ordered:
+                        if row[1].startswith(source_prefix) and row[1] not in chosen_by_id:
+                            _add(row)
+                            count += 1
+                            if count >= source_quota or len(chosen_by_id) >= max_keep:
+                                break
+
+                # Main adaptive score band.  This is deliberately not a top-K
+                # fill: a weak candidate below the evidence floor stays out.
+                for row in ordered:
+                    if row[3] >= score_floor:
+                        _add(row)
+                        if len(chosen_by_id) >= max_keep:
+                            break
+
+                # Guarantee a small recall floor even when scores are uniformly
+                # low or the block is noisy.
+                for row in ordered:
+                    if len(chosen_by_id) >= min_keep:
+                        break
+                    _add(row)
+
+                chosen = sorted(chosen_by_id.values(), key=lambda r: (-r[3], r[1]))
+
+            if truth_ids:
+                final_ids = {row[1] for row in chosen}
+                final_hit_pairs += len(truth_ids & final_ids)
+                if truth_ids.issubset(final_ids):
+                    final_complete_s1 += 1
+
+            insert_buffer.extend(
+                (row[0], row[1], float(row[2]), float(row[3]), float(row[4]), float(row[5]), rank)
+                for rank, row in enumerate(chosen, start=1)
             )
 
-        self.connection.execute("DROP TABLE selected_candidates")
-        self.connection.execute("DROP TABLE scored_candidates")
-        self.connection.execute("DROP TABLE shortlist")
+            if len(insert_buffer) >= 20_000:
+                self.connection.executemany(
+                    "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,rank) VALUES (?,?,?,?,?,?,?)",
+                    insert_buffer,
+                )
+                insert_buffer.clear()
+                self.connection.commit()
+
+        while True:
+            batch = reader.fetchmany(50_000)
+            if not batch:
+                break
+            for row in batch:
+                sid = row[0]
+                if current_sid is None:
+                    current_sid = sid
+                if sid != current_sid:
+                    _select_and_insert(current_rows, current_sid)
+                    current_rows = []
+                    current_sid = sid
+                current_rows.append(row)
+
+        if current_sid is not None:
+            _select_and_insert(current_rows, current_sid)
+
+        if insert_buffer:
+            self.connection.executemany(
+                "INSERT INTO final_candidates(source1_id,target_id,evidence,similarity,name_score,address_score,rank) VALUES (?,?,?,?,?,?,?)",
+                insert_buffer,
+            )
+            insert_buffer.clear()
+        self.connection.commit()
+
+        # Any truth-only Source-1 entities not encountered in raw_candidates had
+        # zero retrieval at both pruning stages and are therefore already counted
+        # as misses by the denominator below.
+        if has_truth:
+            diagnostics["shortlist"] = {
+                "recall": shortlist_hit_pairs / truth_total_pairs if truth_total_pairs else 1.0,
+                "retrieved": shortlist_hit_pairs,
+                "total": truth_total_pairs,
+                "complete_match_set_recall": shortlist_complete_s1 / truth_total_s1 if truth_total_s1 else 1.0,
+            }
+            diagnostics["final"] = {
+                "recall": final_hit_pairs / truth_total_pairs if truth_total_pairs else 1.0,
+                "retrieved": final_hit_pairs,
+                "total": truth_total_pairs,
+                "complete_match_set_recall": final_complete_s1 / truth_total_s1 if truth_total_s1 else 1.0,
+                "s1_with_zero_true_candidates": 0.0,
+                "by_country": self._country_diagnostics("final_candidates"),
+            }
+
+            # Exact zero-hit S1 rates are cheap to compute from the final table.
+            diagnostics["shortlist"].pop("s1_with_zero_true_candidates", None)
+            diagnostics["final"]["s1_with_zero_true_candidates"] = self._s1_zero_true_candidates("final_candidates")
+
+        fin_stats = self._candidate_stats("final_candidates")
+        diagnostics["final_stats"] = fin_stats
+        if has_truth:
+            # Preserve the existing diagnostic name expected by downstream logs.
+            diagnostics["final"]["s1_with_zero_true_candidates"] = self._s1_zero_true_candidates("final_candidates")
+
         self.connection.execute("DROP TABLE raw_candidates")
         self.connection.commit()
 
-        if has_truth:
-            fin_r, fin_hit, fin_tot = self._recall_on_table("final_candidates")
-            diagnostics["final"] = {"recall": fin_r, "retrieved": fin_hit, "total": fin_tot}
-            diagnostics["final"]["complete_match_set_recall"] = self._complete_match_set_recall("final_candidates")
-            diagnostics["final"]["s1_with_zero_true_candidates"] = self._s1_zero_true_candidates("final_candidates")
-        fin_stats = self._candidate_stats("final_candidates")
-        diagnostics["final_stats"] = fin_stats
-
         self.diagnostics = diagnostics
-        LOGGER.info("Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity, CMS recall %.4f%%)",
-                    100 * diagnostics.get("final", {}).get("recall", 0),
-                    fin_stats["total_pairs"], fin_stats["avg_candidates"],
-                    100 * diagnostics.get("final", {}).get("complete_match_set_recall", 0))
+        LOGGER.info(
+            "Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity, CMS recall %.4f%%)",
+            100 * diagnostics.get("final", {}).get("recall", 0),
+            fin_stats["total_pairs"],
+            fin_stats["avg_candidates"],
+            100 * diagnostics.get("final", {}).get("complete_match_set_recall", 0),
+        )
         return fin_stats["total_pairs"]
 
     # ─── Legacy method restored to prevent old tests from crashing ───
@@ -1197,16 +1100,40 @@ class BlockingStore:
     def feature_rows(self, where: str = "", parameters: Sequence[object] = ()) -> Iterator[tuple]:
         predicate = f"WHERE {where}" if where else ""
         cursor = self.connection.execute(f"""
-            SELECT c.source1_id, c.target_id, s.country, s.name, s.core, s.sorted_core, s.address, s.numbers,
-                   t.country, t.name, t.core, t.sorted_core, t.address, t.numbers,
-                   c.evidence, c.similarity, c.rank,
-                   CASE WHEN truth.target_id IS NULL THEN 0 ELSE 1 END
-            FROM final_candidates c
-            JOIN source1 s ON s.entity_id=c.source1_id
-            JOIN targets t ON t.entity_id=c.target_id
-            LEFT JOIN truth ON truth.source1_id=c.source1_id AND truth.target_id=c.target_id
-            {predicate}
-            ORDER BY c.source1_id, c.rank, c.target_id
+            WITH ranked AS (
+                SELECT
+                    c.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.source1_id
+                        ORDER BY c.name_score DESC, c.target_id
+                    ) AS name_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.source1_id
+                        ORDER BY c.address_score DESC, c.target_id
+                    ) AS address_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.target_id
+                        ORDER BY c.similarity DESC, c.source1_id
+                    ) AS reverse_similarity_rank
+                FROM final_candidates c
+            )
+            SELECT
+                r.source1_id, r.target_id,
+                s.country, s.name, s.core, s.sorted_core, s.address, s.numbers,
+                t.country, t.name, t.core, t.sorted_core, t.address, t.numbers,
+                r.evidence, r.similarity, r.rank,
+                s.street_number, s.street, s.city, s.postal_code,
+                t.street_number, t.street, t.city, t.postal_code,
+                r.name_rank, r.address_rank, r.reverse_similarity_rank,
+                CASE WHEN r.rank = 1 AND r.reverse_similarity_rank = 1 THEN 1.0 ELSE 0.0 END AS mutual_best,
+                1.0 / (1.0 + ABS(r.name_rank - r.address_rank)) AS rank_agreement,
+                CASE WHEN truth.target_id IS NULL THEN 0 ELSE 1 END
+            FROM ranked r
+            JOIN source1 s ON s.entity_id=r.source1_id
+            JOIN targets t ON t.entity_id=r.target_id
+            LEFT JOIN truth ON truth.source1_id=r.source1_id AND truth.target_id=r.target_id
+            {predicate.replace('c.', 'r.').replace('s.', 's.')}
+            ORDER BY r.source1_id, r.rank, r.target_id
         """, parameters)
         yield from cursor
 
@@ -1218,6 +1145,66 @@ class BlockingStore:
 
     def _has_truth(self) -> bool:
         return self.connection.execute("SELECT COUNT(*) FROM truth").fetchone()[0] > 0
+
+    def _country_diagnostics(self, table: str) -> dict[str, dict]:
+        """Return recall/CMS/candidate-count diagnostics split by Source-1 country."""
+        if not self._has_truth():
+            return {}
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                COALESCE(NULLIF(s.country, ''), '<missing>') AS country,
+                COUNT(*) AS truth_pairs,
+                SUM(CASE WHEN c.target_id IS NOT NULL THEN 1 ELSE 0 END) AS retrieved_pairs,
+                COUNT(DISTINCT t.source1_id) AS truth_s1
+            FROM truth t
+            JOIN source1 s ON s.entity_id=t.source1_id
+            LEFT JOIN {table} c
+              ON c.source1_id=t.source1_id AND c.target_id=t.target_id
+            GROUP BY COALESCE(NULLIF(s.country, ''), '<missing>')
+            ORDER BY country
+            """
+        ).fetchall()
+        candidate_rows = self.connection.execute(
+            f"""
+            SELECT
+                COALESCE(NULLIF(s.country, ''), '<missing>') AS country,
+                COUNT(c.target_id) AS candidate_pairs,
+                COUNT(DISTINCT s.entity_id) AS s1_entities
+            FROM source1 s
+            LEFT JOIN {table} c ON c.source1_id=s.entity_id
+            GROUP BY COALESCE(NULLIF(s.country, ''), '<missing>')
+            ORDER BY country
+            """
+        ).fetchall()
+        candidate_map = {row[0]: row for row in candidate_rows}
+        result: dict[str, dict] = {}
+        for country, truth_pairs, retrieved_pairs, truth_s1 in rows:
+            _country, candidate_pairs, s1_entities = candidate_map.get(country, (country, 0, 0))
+            # Complete-set recall requires that every truth target for an S1 is present.
+            cms = self.connection.execute(
+                f"""
+                SELECT COUNT(*) FROM (
+                    SELECT t.source1_id,
+                           COUNT(*) - COUNT(c.target_id) AS missing
+                    FROM truth t
+                    JOIN source1 s ON s.entity_id=t.source1_id
+                    LEFT JOIN {table} c
+                      ON c.source1_id=t.source1_id AND c.target_id=t.target_id
+                    WHERE COALESCE(NULLIF(s.country, ''), '<missing>')=?
+                    GROUP BY t.source1_id
+                ) q WHERE q.missing=0
+                """, (country,)
+            ).fetchone()[0]
+            result[country] = {
+                "pair_recall": retrieved_pairs / truth_pairs if truth_pairs else 1.0,
+                "complete_match_set_recall": cms / truth_s1 if truth_s1 else 1.0,
+                "retrieved_pairs": int(retrieved_pairs),
+                "truth_pairs": int(truth_pairs),
+                "candidate_pairs": int(candidate_pairs),
+                "candidate_avg": candidate_pairs / s1_entities if s1_entities else 0.0,
+            }
+        return result
 
     def _recall_on_table(self, table: str, where: str = "", parameters: Sequence[object] = ()) -> tuple[float, int, int]:
         predicate = f"WHERE {where}" if where else ""
@@ -1266,7 +1253,8 @@ class BlockingStore:
         # Source-1 entities.
         counts = np.fromiter(
             (int(row[0]) for row in self.connection.execute(
-                f"SELECT COUNT(*) FROM {table} GROUP BY source1_id"
+                f"SELECT COUNT({table}.target_id) FROM source1 LEFT JOIN {table} "
+                f"ON {table}.source1_id = source1.entity_id GROUP BY source1.entity_id"
             )),
             dtype=np.int32,
         )

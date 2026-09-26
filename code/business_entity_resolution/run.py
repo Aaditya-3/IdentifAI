@@ -6,9 +6,9 @@ import logging
 from pathlib import Path
 
 try:  # Supports both ``python run.py`` from this directory and module execution.
-    from .src.pipeline import predict, validate
+    from .src.pipeline import DEFAULT_TOP_K, predict, validate
 except ImportError:
-    from src.pipeline import predict, validate
+    from src.pipeline import DEFAULT_TOP_K, predict, validate
 
 
 # Repository root:
@@ -32,41 +32,31 @@ def _resolve_dir(
     *,
     default: Path,
     description: str,
+    create: bool = False,
 ) -> Path:
+    """Resolve a directory and optionally create it.
+
+    Data directories must already exist; output/work directories are created
+    automatically so a clean checkout is runnable without manual setup.
+    Relative paths are interpreted from the repository root for reproducibility.
     """
-    Resolve a user-supplied or default directory.
+    raw = Path(value).expanduser() if value else default
+    path = raw.resolve() if raw.is_absolute() else (REPO_ROOT / raw).resolve()
 
-    Priority:
-      1. Explicit path supplied by user.
-      2. Repository-local default path.
-
-    Relative explicit paths are interpreted relative to the repository root,
-    not the current working directory.
-    """
-    if value:
-        raw = Path(value).expanduser()
-
-        if raw.is_absolute():
-            path = raw.resolve()
-        else:
-            path = (REPO_ROOT / raw).resolve()
-
+    if path.exists():
         if not path.is_dir():
-            raise FileNotFoundError(
-                f"{description} directory does not exist:\n{path}"
-            )
-
+            raise NotADirectoryError(f"{description} path is not a directory:\n{path}")
         return path
 
-    path = default.resolve()
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    if not path.is_dir():
-        raise FileNotFoundError(
-            f"Default {description} directory does not exist:\n{path}\n"
-            f"Pass the correct path explicitly."
-        )
-
-    return path
+    source = "Explicit" if value else "Default"
+    raise FileNotFoundError(
+        f"{source} {description} directory does not exist:\n{path}\n"
+        "Pass the correct path explicitly."
+    )
 
 
 def main() -> None:
@@ -122,8 +112,8 @@ def main() -> None:
     parser.add_argument(
         "--top_k",
         type=int,
-        default=64,
-        help="Final bounded candidates retained per Source-1 entity.",
+        default=DEFAULT_TOP_K,
+        help=f"Maximum candidates retained per Source-1 entity (default: {DEFAULT_TOP_K}).",
     )
 
     parser.add_argument(
@@ -138,7 +128,19 @@ def main() -> None:
         help="Disk workspace. Defaults to repository-root/scratch.",
     )
 
+    parser.add_argument(
+        "--check-submission",
+        action="store_true",
+        help=(
+            "After predict, also run the official stdlib submission validator "
+            "with --check-ids. This can use substantial memory on the full test set."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.top_k < 1:
+        parser.error("--top_k must be at least 1")
 
     # ---------------------------------------------------------
     # Resolve canonical paths
@@ -166,12 +168,14 @@ def main() -> None:
         args.output_dir,
         default=DEFAULT_OUTPUT_DIR,
         description="output",
+        create=True,
     )
 
     scratch_dir = _resolve_dir(
         args.scratch_dir,
         default=DEFAULT_SCRATCH_DIR,
         description="scratch",
+        create=True,
     )
 
     # ---------------------------------------------------------
@@ -232,6 +236,21 @@ def main() -> None:
         f"Wrote submission files to {output_dir} "
         f"(threshold={threshold:.6f})"
     )
+
+    if args.check_submission:
+        import subprocess
+        validator = REPO_ROOT / "student_resource" / "utils" / "validate_submission.py"
+        if not validator.exists():
+            raise FileNotFoundError(f"Official submission validator not found: {validator}")
+        command = [
+            "python", str(validator),
+            "--matching", str(output_dir / "matching_results.tsv"),
+            "--candidate", str(output_dir / "candidate_pairs.tsv"),
+            "--test-dir", str(test_dir),
+            "--check-ids",
+        ]
+        logging.info("Running official submission validator with --check-ids")
+        subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":
