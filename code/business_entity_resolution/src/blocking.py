@@ -76,7 +76,11 @@ class BlockingStore:
         self._active_key_hashes: np.ndarray | None = None
         self.diagnostics: dict = {}
         self.semantic_config = SemanticConfig.from_environment(top_k=self.top_k)
-        self.semantic_retriever = SemanticRetriever(self.semantic_config)
+        semantic_id_path = self.path.with_suffix(self.path.suffix + ".semantic_ids")
+        self.semantic_retriever = SemanticRetriever(
+            self.semantic_config,
+            id_storage_path=semantic_id_path,
+        )
 
     def close(self) -> None:
         try:
@@ -524,9 +528,19 @@ class BlockingStore:
         """)
         self._rescue_high_frequency_keys()
 
-        # Independent semantic retrieval route: BGE bi-encoder + FAISS HNSW.
-        # It augments, rather than replaces, deterministic lexical blocking.
+        # Independent semantic retrieval route. The semantic retriever is
+        # memory-bounded and fail-open. It is used as a rescue route only for
+        # Source-1 entities whose lexical candidate set is small. This avoids
+        # generating a second large candidate universe when lexical retrieval
+        # already provides enough evidence.
         if self.semantic_config.enabled:
+            target_count = int(self.connection.execute("SELECT COUNT(*) FROM targets").fetchone()[0])
+            target_id_width = int(
+                self.connection.execute(
+                    "SELECT COALESCE(MAX(LENGTH(CAST(entity_id AS BLOB))), 8) FROM targets"
+                ).fetchone()[0]
+            ) + 1
+
             target_cursor = self.connection.execute(
                 "SELECT entity_id, country, name, core, sorted_core, address "
                 "FROM targets ORDER BY entity_id"
@@ -536,57 +550,121 @@ class BlockingStore:
                     (row[0], entity_text(row[2], row[5], row[1]))
                     for row in target_cursor
                 )
-                self.semantic_retriever.build(target_iter)
+                self.semantic_retriever.build(
+                    target_iter,
+                    target_count=target_count,
+                    target_id_width=target_id_width,
+                )
             finally:
-                # The semantic path may stop early when dependencies are unavailable.
-                # Explicitly close the SQLite cursor so later DROP TABLE statements
-                # cannot inherit a read lock.
                 target_cursor.close()
 
-            source_cursor = self.connection.execute(
-                "SELECT entity_id, country, name, core, sorted_core, address "
-                "FROM source1 ORDER BY entity_id"
-            )
-            try:
-                source_iter = (
-                    (row[0], entity_text(row[2], row[5], row[1]))
-                    for row in source_cursor
-                )
-                semantic_rows = self.semantic_retriever.query(
-                    source_iter, top_k=self.semantic_config.semantic_top_k
-                )
-            finally:
-                source_cursor.close()
-            self.connection.executemany(
-                """
-                INSERT INTO raw_candidates(
-                    source1_id, target_id, evidence, support_count,
-                    name_evidence, address_evidence, structural_evidence, exact_evidence,
-                    semantic_score, semantic_rank
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source1_id, target_id) DO UPDATE SET
-                    evidence = MAX(raw_candidates.evidence, excluded.evidence),
-                    support_count = raw_candidates.support_count + excluded.support_count,
-                    semantic_score = MAX(raw_candidates.semantic_score, excluded.semantic_score),
-                    semantic_rank = CASE
-                        WHEN raw_candidates.semantic_rank = 0 THEN excluded.semantic_rank
-                        ELSE MIN(raw_candidates.semantic_rank, excluded.semantic_rank)
-                    END
-                """,
-                (
-                    (sid, tid, max(0.0, score), 1, 0.0, 0.0, 0.0, 0.0, float(score), int(rank))
-                    for sid, tid, score, rank in semantic_rows
-                ),
-            )
-            self.connection.commit()
+            semantic_rows = 0
+            semantic_query_sources = 0
+            semantic_config = self.semantic_config
+            if self.semantic_retriever.using_real_backend:
+                trigger = int(semantic_config.semantic_trigger_candidates)
+                if trigger > 0:
+                    source_query = """
+                        SELECT s.entity_id, s.country, s.name, s.core, s.sorted_core, s.address
+                        FROM source1 s
+                        LEFT JOIN (
+                            SELECT source1_id, COUNT(*) AS lexical_count
+                            FROM raw_candidates
+                            GROUP BY source1_id
+                        ) rc ON rc.source1_id = s.entity_id
+                        WHERE COALESCE(rc.lexical_count, 0) < ?
+                        ORDER BY COALESCE(rc.lexical_count, 0), s.entity_id
+                    """
+                    source_params = (trigger,)
+                else:
+                    source_query = (
+                        "SELECT entity_id, country, name, core, sorted_core, address "
+                        "FROM source1 ORDER BY entity_id"
+                    )
+                    source_params = ()
+                source_cursor = self.connection.execute(source_query, source_params)
+                insert_buffer: list[tuple] = []
+                try:
+                    source_count_limit = int(semantic_config.semantic_max_queries)
+                    processed_sources = 0
+
+                    def source_rows() -> Iterator[tuple[str, str]]:
+                        nonlocal processed_sources
+                        for row in source_cursor:
+                            if source_count_limit > 0 and processed_sources >= source_count_limit:
+                                break
+                            processed_sources += 1
+                            yield row[0], entity_text(row[2], row[5], row[1])
+
+                    for sid, tid, score, rank in self.semantic_retriever.iter_query(
+                        source_rows(), top_k=self.semantic_config.semantic_top_k
+                    ):
+                        insert_buffer.append(
+                            (
+                                sid, tid, max(0.0, float(score)), 1,
+                                0.0, 0.0, 0.0, 0.0, float(score), int(rank),
+                            )
+                        )
+                        semantic_rows += 1
+                        if len(insert_buffer) >= 50_000:
+                            self.connection.executemany(
+                                """
+                                INSERT INTO raw_candidates(
+                                    source1_id, target_id, evidence, support_count,
+                                    name_evidence, address_evidence, structural_evidence, exact_evidence,
+                                    semantic_score, semantic_rank
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(source1_id, target_id) DO UPDATE SET
+                                    evidence = MAX(raw_candidates.evidence, excluded.evidence),
+                                    support_count = raw_candidates.support_count + excluded.support_count,
+                                    semantic_score = MAX(raw_candidates.semantic_score, excluded.semantic_score),
+                                    semantic_rank = CASE
+                                        WHEN raw_candidates.semantic_rank = 0 THEN excluded.semantic_rank
+                                        ELSE MIN(raw_candidates.semantic_rank, excluded.semantic_rank)
+                                    END
+                                """,
+                                insert_buffer,
+                            )
+                            insert_buffer.clear()
+                            self.connection.commit()
+                    if insert_buffer:
+                        self.connection.executemany(
+                            """
+                            INSERT INTO raw_candidates(
+                                source1_id, target_id, evidence, support_count,
+                                name_evidence, address_evidence, structural_evidence, exact_evidence,
+                                semantic_score, semantic_rank
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source1_id, target_id) DO UPDATE SET
+                                evidence = MAX(raw_candidates.evidence, excluded.evidence),
+                                support_count = raw_candidates.support_count + excluded.support_count,
+                                semantic_score = MAX(raw_candidates.semantic_score, excluded.semantic_score),
+                                semantic_rank = CASE
+                                    WHEN raw_candidates.semantic_rank = 0 THEN excluded.semantic_rank
+                                    ELSE MIN(raw_candidates.semantic_rank, excluded.semantic_rank)
+                                END
+                            """,
+                            insert_buffer,
+                        )
+                        insert_buffer.clear()
+                        self.connection.commit()
+                    semantic_query_sources = processed_sources
+                finally:
+                    source_cursor.close()
+
             self.diagnostics["semantic_retrieval"] = {
                 "enabled": True,
                 "backend": self.semantic_retriever.backend,
                 "embedding_model": self.semantic_config.embedding_model,
                 "semantic_top_k": self.semantic_config.semantic_top_k,
                 "rerank_top_k": self.semantic_config.rerank_top_k,
-                "hnsw_ef_search": self.semantic_config.hnsw_ef_search,
-                "retrieved_rows": len(semantic_rows),
+                "index_kind": self.semantic_config.index_kind,
+                "trigger_candidates": self.semantic_config.semantic_trigger_candidates,
+                "max_queries": self.semantic_config.semantic_max_queries,
+                **self.semantic_retriever.index_stats,
+                "retrieved_rows": semantic_rows,
+                "query_sources": semantic_query_sources,
+                "target_count": target_count,
                 "fallback_reason": self.semantic_retriever.failure_reason,
             }
         else:
@@ -780,7 +858,7 @@ class BlockingStore:
         structural_quota = max(1, self.top_k // 2)
         semantic_quota = (
             min(shortlist_budget, max(self.top_k, self.semantic_config.semantic_top_k))
-            if self.semantic_config.enabled else 0
+            if self.semantic_retriever.using_real_backend else 0
         )
         lexical_name_quota = max(1, self.top_k + self.top_k // 2)
         lexical_address_quota = max(1, self.top_k + self.top_k // 2)

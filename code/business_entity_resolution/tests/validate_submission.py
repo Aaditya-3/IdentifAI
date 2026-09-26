@@ -17,12 +17,12 @@ It validates two files:
   your candidates and *warns* (never fails) otherwise. When absent it is skipped
   with a warning; it is still expected in your final submission zip.
 
-Stdlib only, Python 3.8+. Run it from the repository or package directory::
+Stdlib only, Python 3.8+. Run from the ``student_resource/`` directory::
 
-    python3 code/business_entity_resolution/utils/validate_submission.py \
+    python3 utils/validate_submission.py \
         --matching output/matching_results.tsv \
         --candidate output/candidate_pairs.tsv \
-        --test-dir /path/to/test
+        --test-dir dataset/test
 
 Exit code 0 means the files are safe to submit; 1 means fix the listed issues
 (warnings never fail the run).

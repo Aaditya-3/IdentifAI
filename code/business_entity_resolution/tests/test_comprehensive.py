@@ -661,16 +661,20 @@ class TestSemanticFailureSafety(unittest.TestCase):
                 return np.ones((len(texts), 4), dtype=np.float32)
 
         class FakeIndex:
-            def __init__(self, dimension, m, metric):
+            def __init__(self, dimension):
                 self.vectors = np.empty((0, dimension), dtype=np.float32)
-                self.hnsw = types.SimpleNamespace(efConstruction=0, efSearch=0)
+                self.ntotal = 0
+                self.is_trained = True
 
             def add(self, values):
+                values = np.asarray(values, dtype=np.float32)
                 self.vectors = np.vstack([self.vectors, values])
+                self.ntotal = self.vectors.shape[0]
 
             def search(self, queries, k):
                 scores = queries @ self.vectors.T
-                idx = np.tile(np.arange(min(k, self.vectors.shape[0])), (len(queries), 1))
+                k = min(k, self.vectors.shape[0])
+                idx = np.argsort(-scores, axis=1, kind="stable")[:, :k]
                 dist = np.take_along_axis(scores, idx, axis=1)
                 return dist, idx
 
@@ -683,7 +687,7 @@ class TestSemanticFailureSafety(unittest.TestCase):
         fake_st.CrossEncoder = FailingCrossEncoder
         fake_faiss = types.ModuleType("faiss")
         fake_faiss.METRIC_INNER_PRODUCT = 0
-        fake_faiss.IndexHNSWFlat = FakeIndex
+        fake_faiss.IndexFlatIP = FakeIndex
         sys.modules["sentence_transformers"] = fake_st
         sys.modules["faiss"] = fake_faiss
         try:
@@ -703,6 +707,91 @@ class TestSemanticFailureSafety(unittest.TestCase):
         finally:
             sys.modules.pop("sentence_transformers", None)
             sys.modules.pop("faiss", None)
+
+
+    def test_ivfpq_large_target_path_is_bounded_and_streaming(self):
+        import sys
+        import types
+
+        class FakeEncoder:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def encode(self, texts, **kwargs):
+                return np.ones((len(texts), 4), dtype=np.float32)
+
+        class FakeIVFPQ:
+            def __init__(self, quantizer, dimension, nlist, m, nbits, metric):
+                self.vectors = np.empty((0, dimension), dtype=np.float32)
+                self.is_trained = False
+                self.ntotal = 0
+                self.nlist = nlist
+                self.nprobe = 1
+                self.use_precomputed_table = 0
+
+            def train(self, values):
+                self.is_trained = True
+
+            def add(self, values):
+                values = np.asarray(values, dtype=np.float32)
+                self.vectors = np.vstack([self.vectors, values])
+                self.ntotal = self.vectors.shape[0]
+
+            def search(self, queries, k):
+                scores = np.asarray(queries, dtype=np.float32) @ self.vectors.T
+                k = min(k, self.vectors.shape[0])
+                indices = np.argsort(-scores, axis=1, kind="stable")[:, :k]
+                distances = np.take_along_axis(scores, indices, axis=1)
+                return distances, indices
+
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = FakeEncoder
+        class FakeFlat:
+            def __init__(self, dimension):
+                self.dimension = int(dimension)
+
+        fake_faiss = types.ModuleType("faiss")
+        fake_faiss.METRIC_INNER_PRODUCT = 0
+        fake_faiss.IndexFlatIP = FakeFlat
+        fake_faiss.IndexIVFPQ = FakeIVFPQ
+        sys.modules["sentence_transformers"] = fake_st
+        sys.modules["faiss"] = fake_faiss
+        try:
+            from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+            retriever = SemanticRetriever(
+                SemanticConfig(
+                    enabled=True,
+                    encode_batch_size=32,
+                    semantic_top_k=2,
+                    train_sample_size=2_000,
+                    min_free_gb=0.1,
+                    max_available_fraction=0.99,
+                    model_memory_gb=0.25,
+                )
+            )
+            targets = [(f"T{i}", f"business name: name {i}") for i in range(2_048)]
+            retriever.build(targets, target_count=2_048, target_id_width=16)
+            self.assertTrue(retriever.using_real_backend)
+            self.assertTrue(retriever.index_stats["nlist"] > 0)
+            rows = list(retriever.iter_query([("S1", "business name: name 1")], top_k=2))
+            self.assertEqual(len(rows), 2)
+            retriever.close()
+        finally:
+            sys.modules.pop("sentence_transformers", None)
+            sys.modules.pop("faiss", None)
+
+    def test_semantic_preflight_disables_only_semantic_route(self):
+        from src.semantic_retrieval import SemanticConfig, SemanticRetriever
+
+        retriever = SemanticRetriever(
+            SemanticConfig(enabled=True, allow_fallback=True, min_free_gb=999_999.0)
+        )
+        ok = retriever.preflight(10_000_000)
+        self.assertFalse(ok)
+        self.assertFalse(retriever.using_real_backend)
+        self.assertEqual(retriever.backend, "disabled_fallback")
+
 
 
 class TestDeterminism(unittest.TestCase):
@@ -779,17 +868,21 @@ def test_semantic_retriever_real_backend_contract_with_stubs(monkeypatch):
         def predict(self, pairs, **kwargs):
             return np.asarray([0.93] * len(pairs), dtype=np.float32)
 
-    class FakeHNSW: 
-        def __init__(self, dimension, m, metric):
+    class FakeFlat: 
+        def __init__(self, dimension):
             self.dimension = dimension
             self.vectors = np.empty((0, dimension), dtype=np.float32)
-            self.hnsw = types.SimpleNamespace(efConstruction=0, efSearch=0)
+            self.ntotal = 0
+            self.is_trained = True
 
         def add(self, values):
-            self.vectors = np.vstack([self.vectors, np.asarray(values, dtype=np.float32)])
+            values = np.asarray(values, dtype=np.float32)
+            self.vectors = np.vstack([self.vectors, values])
+            self.ntotal = self.vectors.shape[0]
 
         def search(self, queries, k):
             scores = np.asarray(queries, dtype=np.float32) @ self.vectors.T
+            k = min(k, self.vectors.shape[0])
             indices = np.argsort(-scores, axis=1, kind="stable")[:, :k]
             distances = np.take_along_axis(scores, indices, axis=1)
             return distances, indices
@@ -799,7 +892,7 @@ def test_semantic_retriever_real_backend_contract_with_stubs(monkeypatch):
     fake_st.CrossEncoder = FakeCrossEncoder
     fake_faiss = types.ModuleType("faiss")
     fake_faiss.METRIC_INNER_PRODUCT = 0
-    fake_faiss.IndexHNSWFlat = FakeHNSW
+    fake_faiss.IndexFlatIP = FakeFlat
     monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
     monkeypatch.setitem(sys.modules, "faiss", fake_faiss)
 

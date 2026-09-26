@@ -8,8 +8,10 @@ report as the evidence baseline instead of guessing before a real run.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import os
 import logging
 import sqlite3
 import time
@@ -35,7 +37,10 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = BlockingStore.TOP_K
 BASELINE_THRESHOLD = 0.5
-CACHE_SCHEMA_VERSION = "2026-09-27-entity-resolution-v12-semantic"
+CACHE_SCHEMA_VERSION = "2026-09-27-entity-resolution-v13-bounded-semantic"
+DEFAULT_MAX_TRAIN_ROWS = 2_000_000
+DEFAULT_MIN_NEGATIVE_SAMPLE_MOD = 8
+DEFAULT_MAX_NEGATIVE_SAMPLE_MOD = 512
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,8 @@ def _module_signature(*names: str) -> dict[str, str]:
 
 
 def _assert_materialized(paths: Sequence[Path]) -> None:
+    entity_columns = {"entity_id", "business_name", "business_address", "country"}
+    truth_columns = {"source1_entity_id", "matched_entity_ids"}
     for path in paths:
         if not path.exists():
             raise FileNotFoundError(f"Required dataset file not found: {path}")
@@ -83,6 +90,16 @@ def _assert_materialized(paths: Sequence[Path]) -> None:
             raise RuntimeError(
                 f"Dataset file {path} is a Git-LFS pointer, not materialized challenge data. "
                 "Fetch the official challenge dataset before running the pipeline."
+            )
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            fieldnames = set(csv.DictReader(handle, delimiter="\t").fieldnames or [])
+        required = truth_columns if path.name == "train_ground_truth.tsv" else entity_columns
+        missing = required.difference(fieldnames)
+        if missing:
+            expected = ", ".join(sorted(required))
+            raise ValueError(
+                f"Dataset file {path} has an invalid header. Missing columns: {', '.join(sorted(missing))}. "
+                f"Expected columns: {expected}."
             )
 
 
@@ -201,6 +218,118 @@ def _build_store(
     return store
 
 
+def _training_sampling_config() -> dict[str, int]:
+    return {
+        "max_rows": max(100_000, int(os.getenv("IDENTIFAI_MAX_TRAIN_MATRIX_ROWS", str(DEFAULT_MAX_TRAIN_ROWS)))),
+        "min_mod": max(1, int(os.getenv("IDENTIFAI_MIN_NEGATIVE_SAMPLE_MOD", str(DEFAULT_MIN_NEGATIVE_SAMPLE_MOD)))),
+        "max_mod": max(1, int(os.getenv("IDENTIFAI_MAX_NEGATIVE_SAMPLE_MOD", str(DEFAULT_MAX_NEGATIVE_SAMPLE_MOD)))),
+    }
+
+
+def _bounded_training_condition(
+    store: BlockingStore,
+    where: str,
+    parameters: Sequence[object],
+) -> tuple[str, tuple[object, ...], dict[str, int]]:
+    """Select a deterministic, resource-bounded training subset.
+
+    All available positive labels are retained. Negative/hard-negative rows are
+    sampled deterministically from the candidate table when the materialized
+    training matrix would otherwise exceed the configured row cap. This bounds
+    memory/disk without silently dropping known positives.
+    """
+    config = _training_sampling_config()
+    params = tuple(parameters)
+    base = f"({where})" if where else "1=1"
+    positive = "truth.target_id IS NOT NULL"
+    hard_negative = "(" + " OR ".join((
+        "c.rank = 1",
+        "c.exact_evidence > 0.0",
+        "c.similarity >= 0.82",
+        "c.semantic_score >= 0.85",
+    )) + ")"
+
+    total = int(store.feature_count(where, params))
+    positive_count = int(store.feature_count(f"{base} AND {positive}", params))
+    max_rows = int(config["max_rows"])
+
+    if total <= max_rows:
+        return (
+            where,
+            params,
+            {**config, "sample_mod": 1, "positive_rows": positive_count, "selected_rows": total},
+        )
+
+    if positive_count >= max_rows:
+        # This is an extreme dataset/label-density case. Keep every positive row
+        # and no additional negatives; correctness is preferable to an arbitrary
+        # deletion of labeled matches. The configured cap is a safety target, not a
+        # license to throw away truth labels.
+        condition = f"{base} AND {positive}"
+        selected = positive_count
+        LOGGER.warning(
+            "All positive labels (%d) exceed the configured training cap (%d); "
+            "training on the positive rows only for this slice.",
+            positive_count, max_rows,
+        )
+        return (
+            condition,
+            params,
+            {**config, "sample_mod": 0, "positive_rows": positive_count, "selected_rows": selected},
+        )
+
+    negative_budget = max_rows - positive_count
+    hard_total = int(store.feature_count(f"{base} AND ({hard_negative}) AND NOT ({positive})", params))
+    sample_mod = max(1, int(config["min_mod"]))
+    upper = max(sample_mod, int(config["max_mod"]))
+
+    while True:
+        # A cheap deterministic row-local hash surrogate. It intentionally uses
+        # stable database values rather than Python's randomized hash().
+        sampled = (
+            "((c.rank * 37 + length(s.entity_id) * 11 + "
+            "length(t.entity_id) * 13) % " + str(sample_mod) + ") = 0"
+        )
+        condition = (
+            f"{base} AND (({positive}) OR (({hard_negative}) AND ({sampled})))"
+        )
+        selected = int(store.feature_count(condition, params))
+        if selected <= max_rows or sample_mod >= upper:
+            break
+        sample_mod = min(upper, sample_mod * 2)
+
+    # If hard negatives are still too abundant at the configured maximum modulus,
+    # the selection can still exceed the cap only through correlated deterministic
+    # values. Increase the modulus beyond the user ceiling locally until the actual
+    # SQL count fits; this is a resource-safety mechanism, not a data-specific rule.
+    safety_rounds = 0
+    while selected > max_rows and safety_rounds < 16:
+        sample_mod *= 2
+        safety_rounds += 1
+        sampled = (
+            "((c.rank * 37 + length(s.entity_id) * 11 + "
+            "length(t.entity_id) * 13) % " + str(sample_mod) + ") = 0"
+        )
+        condition = f"{base} AND (({positive}) OR (({hard_negative}) AND ({sampled})))"
+        selected = int(store.feature_count(condition, params))
+
+    LOGGER.info(
+        "Bounded training selection: total=%d positives=%d hard_negatives=%d selected=%d cap=%d sample_mod=%d",
+        total, positive_count, hard_total, selected, max_rows, sample_mod,
+    )
+    return (
+        condition,
+        params,
+        {
+            **config,
+            "sample_mod": sample_mod,
+            "positive_rows": positive_count,
+            "hard_negative_rows": hard_total,
+            "selected_rows": selected,
+        },
+    )
+
+
 def _materialize(
     store: BlockingStore,
     scratch: Path,
@@ -211,13 +340,9 @@ def _materialize(
     subsample: bool = False,
     variation_model: VariationModel | None = None,
 ) -> MatrixFiles:
+    sampling_meta: dict[str, int] = {}
     if labels and subsample:
-        cond = (
-            "(truth.target_id IS NOT NULL OR c.similarity > 0.55 "
-            "OR c.rank <= 4 "
-            "OR (length(s.name) + length(t.name) + c.rank) % 10 = 0)"
-        )
-        where = f"({where}) AND {cond}" if where else cond
+        where, parameters, sampling_meta = _bounded_training_condition(store, where, tuple(parameters))
 
     rows = store.feature_count(where, parameters)
     x_path = scratch / f"{name}.features.f32"
@@ -273,6 +398,8 @@ def _materialize(
         "feature_count": len(FEATURE_NAMES),
         "store_signature": signature_row[0] if signature_row else None,
         "semantic_config": SemanticConfig.from_environment(top_k=store.top_k).signature(),
+        "sampling_config": sampling_meta,
+        "sampling_environment": _training_sampling_config(),
         "module_signatures": _module_signature(
             "features.py", "variation.py", "semantic_retrieval.py"
         ),
@@ -281,7 +408,13 @@ def _materialize(
         json.dumps(matrix_meta, sort_keys=True),
         encoding="utf-8",
     )
-    LOGGER.info("Materialized %s: %d rows x %d features", name, rows, len(FEATURE_NAMES))
+    if sampling_meta:
+        LOGGER.info(
+            "Materialized %s: %d rows x %d features (bounded training sample: %s)",
+            name, rows, len(FEATURE_NAMES), sampling_meta,
+        )
+    else:
+        LOGGER.info("Materialized %s: %d rows x %d features", name, rows, len(FEATURE_NAMES))
     return MatrixFiles(x_path, y_path, pairs_path, rows)
 
 
@@ -314,66 +447,109 @@ def _grouped_f05(
     where: str,
     parameters: Sequence[object] = (),
 ) -> tuple[float, dict[str, float]]:
-    """Compute exact macro F0.5 with the full truth denominator, including missed candidates."""
+    """Compute exact macro F0.5 while keeping per-entity state bounded.
+
+    Candidate rows are written in Source-1 order. We therefore stream one
+    predicted group at a time and merge it with an ordered Source-1/truth cursor
+    instead of materializing several million-ID Python dictionaries.
+    """
     labels = matrix.y()
     if labels is None:
         raise ValueError("Grouped F0.5 requires labels")
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    if len(probabilities) != matrix.rows or len(labels) != matrix.rows:
+        raise ValueError("Probability/label matrix length mismatch")
 
-    s1_ids = [
-        row[0]
-        for row in store.connection.execute(
-            f"SELECT s.entity_id FROM source1 s WHERE {where} ORDER BY s.entity_id", parameters
-        )
-    ]
-    truth_counts = {
-        sid: int(count)
-        for sid, count in store.connection.execute(
-            f"""SELECT t.source1_id, COUNT(*)
-                 FROM truth t JOIN source1 s ON s.entity_id=t.source1_id
-                 WHERE {where} GROUP BY t.source1_id""",
-            parameters,
-        )
-    }
-    pred_counts: dict[str, int] = {}
-    tp_counts: dict[str, int] = {}
+    truth_where = where.replace("s.", "s_truth.") if where else ""
+    truth_predicate = f"WHERE {truth_where}" if truth_where else ""
+    source_predicate = f"WHERE {where}" if where else ""
+    source_cursor = store.connection.execute(
+        f"""
+        SELECT s.entity_id,
+               COALESCE(tc.truth_count, 0) AS truth_count,
+               COALESCE(NULLIF(s.country, ''), '<missing>') AS country
+        FROM source1 s
+        LEFT JOIN (
+            SELECT t.source1_id, COUNT(*) AS truth_count
+            FROM truth t
+            JOIN source1 s_truth ON s_truth.entity_id=t.source1_id
+            {truth_predicate}
+            GROUP BY t.source1_id
+        ) tc ON tc.source1_id=s.entity_id
+        {source_predicate}
+        ORDER BY s.entity_id
+        """,
+        parameters,
+    )
 
+    pair_file = matrix.pairs_path.open("r", encoding="utf-8")
     pair_index = 0
-    current_sid = None
-    with matrix.pairs_path.open("r", encoding="utf-8") as pair_file:
-        for line in pair_file:
-            sid = line.split("\t", 1)[0]
+    pending_line = pair_file.readline()
+
+    def _next_pair_group():
+        nonlocal pending_line, pair_index
+        if not pending_line:
+            return None
+        sid = pending_line.split("\t", 1)[0]
+        predicted = 0
+        tp = 0
+        while pending_line:
+            current_sid = pending_line.split("\t", 1)[0]
             if current_sid != sid:
-                current_sid = sid
-            pred = bool(probabilities[pair_index] >= threshold)
-            if pred:
-                pred_counts[sid] = pred_counts.get(sid, 0) + 1
+                break
+            is_predicted = bool(probabilities[pair_index] >= threshold)
+            if is_predicted:
+                predicted += 1
                 if bool(labels[pair_index]):
-                    tp_counts[sid] = tp_counts.get(sid, 0) + 1
+                    tp += 1
             pair_index += 1
+            pending_line = pair_file.readline()
+        return sid, predicted, tp
+
+    score_sum = 0.0
+    entity_count = 0
+    country_sums: dict[str, float] = {}
+    country_counts: dict[str, int] = {}
+
+    try:
+        pair_group = _next_pair_group()
+        for source_id, truth_count, country in source_cursor:
+            while pair_group is not None and pair_group[0] < source_id:
+                # A candidate group should always correspond to a Source-1 row;
+                # consume defensively rather than allowing desynchronization to
+                # abort the entire evaluation.
+                pair_group = _next_pair_group()
+            if pair_group is not None and pair_group[0] == source_id:
+                _, predicted_count, tp = pair_group
+                pair_group = _next_pair_group()
+            else:
+                predicted_count = 0
+                tp = 0
+
+            score = float(
+                f05_from_counts(
+                    tp=int(tp),
+                    predicted=int(predicted_count),
+                    truth=int(truth_count),
+                )
+            )
+            score_sum += score
+            entity_count += 1
+            country_sums[country] = country_sums.get(country, 0.0) + score
+            country_counts[country] = country_counts.get(country, 0) + 1
+    finally:
+        source_cursor.close()
+        pair_file.close()
+
     if pair_index != matrix.rows:
         raise AssertionError("Pair/label stream length mismatch")
 
-    scores: list[float] = []
-    per_country: dict[str, list[float]] = {}
-    countries = dict(store.connection.execute("SELECT entity_id,country FROM source1"))
-    for sid in s1_ids:
-        truth_count = truth_counts.get(sid, 0)
-        pred_count = pred_counts.get(sid, 0)
-        tp = tp_counts.get(sid, 0)
-        score = float(
-            f05_from_counts(
-                tp=int(tp),
-                predicted=int(pred_count),
-                truth=int(truth_count),
-            )
-        )
-        scores.append(score)
-        country = countries.get(sid, "") or "<missing>"
-        per_country.setdefault(country, []).append(score)
-
     return (
-        float(np.mean(scores)) if scores else 0.0,
-        {country: float(np.mean(values)) for country, values in per_country.items()},
+        score_sum / entity_count if entity_count else 0.0,
+        {
+            country: country_sums[country] / country_counts[country]
+            for country in country_sums
+        },
     )
 
 
@@ -415,7 +591,7 @@ Resolve each Source-1 entity to zero, one, or multiple Source-2/Source-3 entitie
 
 ## Data handling
 
-The pipeline reads only the supplied challenge TSV files. It does not call external entity databases, geocoders, registries, business APIs, or web enrichment services. Git-LFS pointer files are rejected before processing.
+The pipeline reads only the supplied challenge TSV files. It does not call external entity databases, geocoders, registries, business APIs, or web enrichment services. Git-LFS pointer files and malformed dataset headers are rejected before processing.
 
 ## Preprocessing
 
@@ -423,9 +599,11 @@ Names are Unicode-normalized, case-folded, and canonicalized for common legal-fo
 
 ## Candidate generation
 
-Candidate generation combines deterministic lexical blocking with an independent semantic retrieval route. Lexical blocking uses exact and near-exact keys, rare-token filtering, phonetic keys, address structure, and MinHash/LSH. Oversized blocks are handled by a relevance-aware rescue stage instead of arbitrary ID truncation.
+Candidate generation combines deterministic lexical blocking with an independent semantic rescue route. Lexical blocking uses exact and near-exact keys, rare-token filtering, phonetic keys, address structure, and MinHash/LSH. Oversized blocks are handled by a relevance-aware rescue stage instead of arbitrary ID truncation.
 
-The semantic route uses a Sentence-Transformers BGE bi-encoder, normalized embeddings, and a FAISS HNSW inner-product index. For each Source-1 entity it retrieves a bounded semantic neighborhood and unions those candidates with the lexical candidates.
+The semantic route uses a Sentence-Transformers BGE bi-encoder with normalized embeddings and FAISS inner-product search. For large target tables, the index is IVF-PQ with bounded training samples and compressed vector codes. A RAM preflight checks the actual process/container memory budget before semantic resources are loaded. Target IDs use a disk-backed fixed-width memmap for large indexes.
+
+Semantic retrieval is deliberately a rescue path rather than a second full candidate universe: Source-1 entities with enough lexical candidates are not redundantly queried. Semantic query results are streamed directly into SQLite in bounded batches. If optional semantic dependencies, model weights, FAISS, memory, or inference fail, only semantic retrieval is disabled; lexical retrieval and model training continue.
 
 The final candidate set has a configurable hard TOP_K ceiling. Those exact final candidates are the only pairs materialized into the feature matrix and the only pairs eligible for prediction.
 
@@ -435,25 +613,27 @@ The matcher uses lexical, structured-address, country, retrieval-rank, reciproca
 
 ## Matching model
 
-The model layer supports LightGBM, a linear logistic model, and a calibrated probability ensemble. The tuning stage measures model variants on the leakage-safe validation splits and optimizes the grouped macro-F0.5 threshold on the same Source-1 grouping used by the metric.
+The model layer supports LightGBM, a linear logistic model, and a probability ensemble. Training matrices are memory-mapped. Training subsets are deterministically bounded for resource safety while retaining all available positive labels and sampling hard negatives.
 
-Inference uses the tuned threshold through a single entity-level policy. No post-tuning margin or threshold offset is inserted unless it was explicitly measured during tuning.
+The tuning stage measures model variants on leakage-safe validation splits and optimizes grouped macro-F0.5 using the same Source-1 grouping used by the metric. Inference uses the tuned decision policy produced by that measured tuning stage.
 
 ## Cache correctness
 
-SQLite candidate stores and feature matrices are invalidated when dataset signatures, feature counts, semantic configuration, or relevant source-module hashes change. Materialized matrices carry sidecar metadata so a stale feature layout cannot be silently reused.
+SQLite candidate stores and materialized feature matrices are invalidated when dataset signatures, feature counts, sampling configuration, semantic configuration, or relevant source-module hashes change. Materialized matrices carry sidecar metadata so a stale feature layout cannot be silently reused.
 
 ## Reproducibility
 
-All behavior is controlled by code and configuration, not entity-specific IDs or hand-written exceptions. Semantic model names, ANN settings, batch sizes, reranking depth, and device selection can be overridden through environment variables.
+All behavior is controlled by code and configuration, not entity-specific IDs or hand-written exceptions. Semantic model names, ANN settings, batch sizes, resource thresholds, and device selection can be overridden through environment variables.
 
 ## Runtime requirements
 
-The core pipeline remains runnable without transformer or FAISS packages. The optional semantic path uses `sentence-transformers` and `faiss-cpu` when installed and when compatible local/cached BGE weights are available. Network model downloads are disabled by default so offline training does not crash or stall; unavailable semantic assets cause the semantic route to fail open to lexical retrieval. The optional cross-encoder is disabled by default because applying a transformer reranker to millions of pairs is not a bounded runtime operation.
+The core pipeline runs without transformer or FAISS packages. The optional semantic path uses `sentence-transformers` and `faiss-cpu` when installed and when compatible local/cached BGE weights are available. Network model downloads are disabled by default so offline training cannot stall on external model fetching. Resource preflight also prevents the semantic index from consuming an unsafe fraction of available/container RAM.
+
+The optional cross-encoder remains disabled by default because transformer reranking is bounded by `IDENTIFAI_RERANK_TOP_K` and should be enabled only after local model availability and runtime have been measured.
 
 ## Evaluation artifacts
 
-Real-data validation measurements are written to `scratch/validation_report.json` and tuning results to `scratch/tuned_policy.json`. Repository documentation intentionally does not copy those measurements so that synthetic smoke-test results cannot be mistaken for challenge results.
+Real-data validation measurements are written to `scratch/validation_report.json` and tuning results to `scratch/tuned_policy.json`. Repository documentation intentionally does not copy run-specific performance numbers, so synthetic smoke-test results cannot be mistaken for challenge results.
 """
     path.write_text(text, encoding="utf-8")
     return path

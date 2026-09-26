@@ -61,11 +61,13 @@ def _existing_matrix(pipeline_module, store, scratch: Path, name: str, labels: b
     expected_modules = pipeline_module._module_signature(
         "features.py", "variation.py", "semantic_retrieval.py"
     )
+    expected_sampling = pipeline_module._training_sampling_config()
     if (
         meta.get("cache_schema") != pipeline_module.CACHE_SCHEMA_VERSION
         or meta.get("feature_count") != feature_count
         or meta.get("store_signature") != expected_store_signature
         or meta.get("semantic_config") != expected_semantic
+        or meta.get("sampling_environment") != expected_sampling
         or meta.get("module_signatures") != expected_modules
     ):
         return None
