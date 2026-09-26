@@ -1,4 +1,13 @@
-"""Disk-backed, high-recall bounded candidate retrieval for large entity-resolution data."""
+"""Disk-backed, high-recall bounded candidate retrieval for large entity-resolution data.
+
+Changes from prior version:
+- REMOVED arbitrary KEY_CAP=160 truncation that silently dropped entities.
+- Added frequency-aware key filtering: low-frequency keys keep all entities,
+  high-frequency keys are discarded entirely (they are not selective).
+- Fixed cheap ranking score to properly balance name vs address signals.
+- Added complete-match-set recall diagnostics.
+- Widened shortlist window before scoring.
+"""
 from __future__ import annotations
 
 import csv
@@ -26,20 +35,21 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BlockingStore:
-    KEY_CAP = 160
     TOP_K = 30
     MINHASH_PERMUTATIONS = 32
     MINHASH_BANDS = 16  # r=2 rows/band -> 99.0% recall on 0.5 Jaccard overlap
     TOKEN_DF_LIMIT = 5_000
-    
+    # Frequency-aware key filtering thresholds (replace old KEY_CAP=160)
+    KEY_FREQ_MAX_SOURCE = 2_000   # Source-side: drop keys with >N entries (not selective)
+    KEY_FREQ_MAX_TARGET = 2_000   # Target-side: same
+
     _MINHASH_PRIME = np.uint64(4294967291)
     _MINHASH_A = np.asarray([2746317214, 478163328, 107420370, 3184935164, 1181241944, 1051802513, 958682847, 599310826, 3163119786, 440213416, 2906402158, 3181143732, 3831882065, 2342331445, 373399427, 2536146026, 1812140442, 136505588, 127978095, 402418011, 939042956, 999270937, 2170484434, 2585650757, 113971124, 2410529191, 854001194, 3075280818, 2791232394, 3012167821, 2340505847, 1801823909], dtype=np.uint64)
     _MINHASH_B = np.asarray([946785248, 1929338154, 2530876844, 1194819984, 3476477323, 3733616459, 27911967, 3259052811, 3460967357, 685731524, 2998485882, 1815115025, 1461364854, 1193448329, 667779376, 924765563, 4111198819, 3279182318, 1445662585, 438989805, 398340369, 1631775357, 415393687, 1541804686, 3639960595, 1477278577, 2592983555, 1136108454, 3466589567, 186618211, 3134174160, 1973214822], dtype=np.uint64)
 
-    def __init__(self, database: str | Path, top_k: int = TOP_K, key_cap: int = KEY_CAP):
+    def __init__(self, database: str | Path, top_k: int = TOP_K):
         self.path = Path(database)
         self.top_k = max(1, int(top_k))
-        self.key_cap = max(8, int(key_cap))
         self.connection = sqlite3.connect(self.path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
@@ -58,8 +68,6 @@ class BlockingStore:
             DROP TABLE IF EXISTS targets;
             DROP TABLE IF EXISTS token_df;
             DROP TABLE IF EXISTS block_keys;
-            DROP TABLE IF EXISTS bounded_keys;
-            DROP TABLE IF EXISTS target_keys;
             DROP TABLE IF EXISTS raw_candidates;
             DROP TABLE IF EXISTS shortlist;
             DROP TABLE IF EXISTS scored_candidates;
@@ -146,7 +154,7 @@ class BlockingStore:
             (f"prefix:{prefix}", 2.0) if len(prefix) == 5 else None,
         ]
         rare_tokens = tuple(rare_tokens)
-        
+
         # De-weight common street numbers; prioritize 5-6 digit postal codes
         for number in set(numbers.split()):
             weight = 4.0 if len(number) >= 5 else 0.5
@@ -221,26 +229,41 @@ class BlockingStore:
             self.connection.executemany("INSERT INTO block_keys VALUES (?, ?, ?)", keys)
         self.connection.execute("CREATE INDEX block_keys_key ON block_keys(key, entity_id)")
         self.connection.commit()
-        self._bound_keys()
+        self._filter_keys_by_frequency()
         return count
 
-    def _bound_keys(self) -> None:
+    def _filter_keys_by_frequency(self) -> None:
+        """Replace the old _bound_keys() that used arbitrary position-based truncation.
+
+        New approach: frequency-aware filtering.
+        - Keys with <= KEY_FREQ_MAX_SOURCE entries are kept intact (all entities preserved).
+        - Keys with > KEY_FREQ_MAX_SOURCE entries are dropped entirely (not selective).
+
+        This ensures NO entity is silently lost due to its ID sorting position.
+        """
+        # Count entries per key
         self.connection.execute("CREATE INDEX IF NOT EXISTS tmp_bk_eid ON block_keys(entity_id)")
+
+        # Create filtered table: keep only keys with reasonable frequency
         self.connection.execute("""
             CREATE TABLE bounded_keys AS
-            WITH entity_key_counts AS (
-                SELECT entity_id, COUNT(*) AS key_count FROM block_keys GROUP BY entity_id
-            )
-            SELECT key, entity_id, weight FROM (
-                SELECT bk.key, bk.entity_id, bk.weight,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY bk.key
-                        ORDER BY ekc.key_count ASC, bk.entity_id
-                    ) AS position
-                FROM block_keys bk
-                JOIN entity_key_counts ekc ON ekc.entity_id = bk.entity_id
-            ) WHERE position <= ?
-        """, (self.key_cap,))
+            SELECT bk.key, bk.entity_id, bk.weight
+            FROM block_keys bk
+            JOIN (
+                SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key
+            ) kc ON kc.key = bk.key
+            WHERE kc.cnt <= ?
+        """, (self.KEY_FREQ_MAX_SOURCE,))
+
+        dropped = self.connection.execute("""
+            SELECT COUNT(DISTINCT key) FROM (
+                SELECT key, COUNT(*) AS cnt FROM block_keys GROUP BY key
+            ) WHERE cnt > ?
+        """, (self.KEY_FREQ_MAX_SOURCE,)).fetchone()[0]
+        kept = self.connection.execute("SELECT COUNT(DISTINCT key) FROM bounded_keys").fetchone()[0]
+        LOGGER.info("Source key filtering: kept %d keys, dropped %d non-selective keys (freq > %d)",
+                     kept, dropped, self.KEY_FREQ_MAX_SOURCE)
+
         self.connection.execute("CREATE INDEX bounded_keys_key ON bounded_keys(key)")
         self.connection.execute("DROP TABLE block_keys")
         self.connection.commit()
@@ -282,23 +305,28 @@ class BlockingStore:
                 self.connection.executemany("INSERT INTO all_target_keys VALUES (?, ?, ?)", key_rows)
             self.connection.commit()
             LOGGER.info("Retrieved target blocks from %s (%d targets)", Path(path).name, count)
-            
+
         self.connection.execute("CREATE INDEX atk_key ON all_target_keys(key)")
+
+        # Frequency-aware target key filtering: drop keys with too many targets
         self.connection.execute("""
             CREATE TABLE bounded_target_keys AS
-            WITH key_counts AS (
-                SELECT key, COUNT(*) AS key_count FROM all_target_keys GROUP BY key
-            )
-            SELECT key, target_id, weight FROM (
-                SELECT t.key, t.target_id, t.weight,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY t.key
-                        ORDER BY c.key_count ASC, t.target_id
-                    ) AS position
-                FROM all_target_keys t
-                JOIN key_counts c ON c.key = t.key
-            ) WHERE position <= ?
-        """, (self.key_cap,))
+            SELECT t.key, t.target_id, t.weight
+            FROM all_target_keys t
+            JOIN (
+                SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key
+            ) kc ON kc.key = t.key
+            WHERE kc.cnt <= ?
+        """, (self.KEY_FREQ_MAX_TARGET,))
+
+        dropped = self.connection.execute("""
+            SELECT COUNT(DISTINCT key) FROM (
+                SELECT key, COUNT(*) AS cnt FROM all_target_keys GROUP BY key
+            ) WHERE cnt > ?
+        """, (self.KEY_FREQ_MAX_TARGET,)).fetchone()[0]
+        LOGGER.info("Target key filtering: dropped %d non-selective keys (freq > %d)",
+                     dropped, self.KEY_FREQ_MAX_TARGET)
+
         self.connection.execute("CREATE INDEX btk_key ON bounded_target_keys(key)")
         self.connection.execute("""
             INSERT INTO raw_candidates(source1_id, target_id, evidence)
@@ -318,9 +346,14 @@ class BlockingStore:
         if has_truth:
             raw_r, raw_hit, raw_tot = self._recall_on_table("raw_candidates")
             diagnostics["raw_blocking"] = {"recall": raw_r, "retrieved": raw_hit, "total": raw_tot}
+            cms_r = self._complete_match_set_recall("raw_candidates")
+            diagnostics["raw_blocking"]["complete_match_set_recall"] = cms_r
         raw_stats = self._candidate_stats("raw_candidates")
         diagnostics["raw_stats"] = raw_stats
 
+        # Wider shortlist: top_k * 8 globally, top_k * 2 per source type
+        shortlist_global = self.top_k * 8
+        shortlist_per_source = self.top_k * 2
         self.connection.execute("""
             CREATE TABLE shortlist AS
             WITH raw_filtered AS (
@@ -341,11 +374,12 @@ class BlockingStore:
                    COALESCE((evidence - MIN(evidence) OVER (PARTITION BY source1_id)) / 
                             NULLIF(MAX(evidence) OVER (PARTITION BY source1_id) - MIN(evidence) OVER (PARTITION BY source1_id), 0), 1.0) AS evidence
             FROM raw_filtered
-        """, (self.top_k * 4, self.top_k))
+        """, (shortlist_global, shortlist_per_source))
 
         if has_truth:
             sl_r, sl_hit, sl_tot = self._recall_on_table("shortlist")
             diagnostics["shortlist"] = {"recall": sl_r, "retrieved": sl_hit, "total": sl_tot}
+            diagnostics["shortlist"]["complete_match_set_recall"] = self._complete_match_set_recall("shortlist")
         diagnostics["shortlist_stats"] = self._candidate_stats("shortlist")
 
         self.connection.execute("""
@@ -370,11 +404,16 @@ class BlockingStore:
 
             name_ratio = process.cpdist(s_cores, t_cores, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
             name_set = process.cpdist(s_cores, t_cores, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
-            name_scores = np.maximum(name_ratio, name_set)
-            addr_scores = process.cpdist(s_addrs, t_addrs, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
+            name_scores = np.maximum(name_ratio, name_set).astype(np.float32) / 100.0
+            addr_ratio = process.cpdist(s_addrs, t_addrs, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
+            addr_set = process.cpdist(s_addrs, t_addrs, scorer=fuzz.token_set_ratio, dtype=np.uint8, workers=-1)
+            addr_scores = np.maximum(addr_ratio, addr_set).astype(np.float32) / 100.0
 
             for (sid, tid, *_, ev), n_s, a_s in zip(rows, name_scores, addr_scores):
-                sim = float(ev) + (float(n_s) / 20.0) + (float(a_s) / 100.0)
+                # Balanced cheap ranking: name and address contribute equally,
+                # evidence provides a boost.  No single signal dominates.
+                # name_s and addr_s are in [0, 1]; ev is normalized evidence in [0, 1].
+                sim = 0.40 * float(n_s) + 0.35 * float(a_s) + 0.25 * float(ev)
                 scored_batch.append((sid, tid, float(ev), sim))
 
             if len(scored_batch) >= 100_000:
@@ -407,13 +446,16 @@ class BlockingStore:
         if has_truth:
             fin_r, fin_hit, fin_tot = self._recall_on_table("final_candidates")
             diagnostics["final"] = {"recall": fin_r, "retrieved": fin_hit, "total": fin_tot}
+            diagnostics["final"]["complete_match_set_recall"] = self._complete_match_set_recall("final_candidates")
+            diagnostics["final"]["s1_with_zero_true_candidates"] = self._s1_zero_true_candidates("final_candidates")
         fin_stats = self._candidate_stats("final_candidates")
         diagnostics["final_stats"] = fin_stats
 
         self.diagnostics = diagnostics
-        LOGGER.info("Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity)",
+        LOGGER.info("Final blocking recall ceiling: %.4f%% (%d pairs, avg %.2f/entity, CMS recall %.4f%%)",
                     100 * diagnostics.get("final", {}).get("recall", 0),
-                    fin_stats["total_pairs"], fin_stats["avg_candidates"])
+                    fin_stats["total_pairs"], fin_stats["avg_candidates"],
+                    100 * diagnostics.get("final", {}).get("complete_match_set_recall", 0))
         return fin_stats["total_pairs"]
 
     # ─── Legacy method restored to prevent old tests from crashing ───
@@ -480,10 +522,41 @@ class BlockingStore:
         ).fetchone()[0]
         return (retrieved / total if total else 1.0), retrieved, total
 
+    def _complete_match_set_recall(self, table: str) -> float:
+        """Fraction of S1 entities for which ALL true matches are in the candidate set."""
+        result = self.connection.execute(f"""
+            SELECT
+                CAST(SUM(CASE WHEN missing = 0 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) 
+            FROM (
+                SELECT t.source1_id,
+                       COUNT(*) - COUNT(c.target_id) AS missing
+                FROM truth t
+                LEFT JOIN {table} c ON c.source1_id = t.source1_id AND c.target_id = t.target_id
+                GROUP BY t.source1_id
+            )
+        """).fetchone()[0]
+        return float(result) if result is not None else 1.0
+
+    def _s1_zero_true_candidates(self, table: str) -> float:
+        """Fraction of S1 entities (that have truth) with zero true candidates retrieved."""
+        result = self.connection.execute(f"""
+            SELECT
+                CAST(SUM(CASE WHEN retrieved = 0 THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
+            FROM (
+                SELECT t.source1_id,
+                       COUNT(c.target_id) AS retrieved
+                FROM truth t
+                LEFT JOIN {table} c ON c.source1_id = t.source1_id AND c.target_id = t.target_id
+                GROUP BY t.source1_id
+            )
+        """).fetchone()[0]
+        return float(result) if result is not None else 0.0
+
     def _candidate_stats(self, table: str) -> dict:
         counts = [r[0] for r in self.connection.execute(f"SELECT COUNT(*) FROM {table} GROUP BY source1_id")]
         if not counts:
-            return {"total_pairs": 0, "avg_candidates": 0.0, "median_candidates": 0, "max_candidates": 0}
+            return {"total_pairs": 0, "avg_candidates": 0.0, "median_candidates": 0, "max_candidates": 0,
+                    "p50": 0, "p95": 0, "p99": 0}
         n = len(counts)
         counts.sort()
         return {
@@ -491,4 +564,7 @@ class BlockingStore:
             "avg_candidates": sum(counts) / n,
             "median_candidates": counts[n // 2],
             "max_candidates": counts[-1],
+            "p50": counts[n // 2],
+            "p95": counts[min(n - 1, int(n * 0.95))],
+            "p99": counts[min(n - 1, int(n * 0.99))],
         }

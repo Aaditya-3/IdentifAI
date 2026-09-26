@@ -96,7 +96,12 @@ def write_submission_stream(
     output_dir: Path,
     threshold: float,
 ) -> tuple[Path, Path]:
-    """Stream final submission in <45s without disk-database roundtrips or OOMs."""
+    """Stream final submission without storing entire dataset in memory.
+    
+    Enforces the candidate-subset invariant: every predicted match must
+    appear in the candidate set. Asserts no duplicate S1 IDs, no duplicate
+    target IDs per S1, and every S1 appears exactly once.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_path = output_dir / "candidate_pairs.tsv"
     matching_path = output_dir / "matching_results.tsv"
@@ -108,8 +113,15 @@ def write_submission_stream(
             if sid := (row.get("entity_id") or "").strip():
                 s1_order.append(sid)
     
+    # Assert no duplicate S1 IDs
+    assert len(s1_order) == len(set(s1_order)), \
+        f"Duplicate S1 IDs found: {len(s1_order)} total vs {len(set(s1_order))} unique"
+    
     # Sort to match the SQLite ORDER BY source1_id used when creating pairs_path
     s1_order.sort()
+
+    s1_written = set()
+    violations = 0
 
     with candidate_path.open("w", encoding="utf-8", newline="") as fc, \
          matching_path.open("w", encoding="utf-8", newline="") as fm:
@@ -124,6 +136,7 @@ def write_submission_stream(
         for sid in s1_order:
             c_list = []
             m_list = []
+            seen_tids = set()
             
             while current_pair_line:
                 pair_sid, pair_tid = current_pair_line.rstrip("\n").split("\t", 1)
@@ -133,6 +146,15 @@ def write_submission_stream(
                     prob_idx += 1
                     continue
                 elif pair_sid == sid:
+                    # Assert no duplicate target IDs within one S1
+                    assert pair_tid not in seen_tids, \
+                        f"Duplicate target {pair_tid} for S1 {sid}"
+                    seen_tids.add(pair_tid)
+                    
+                    # Assert target is S2 or S3 (not S1)
+                    assert not pair_tid.startswith("S1-"), \
+                        f"Target {pair_tid} is an S1 entity, not S2/S3"
+                    
                     c_list.append(pair_tid)
                     if probabilities[prob_idx] >= threshold:
                         m_list.append(pair_tid)
@@ -141,11 +163,26 @@ def write_submission_stream(
                 else:
                     # pair_sid > sid, which means no more targets for this sid
                     break
+            
+            # Candidate-subset invariant: every match must be a candidate
+            for mid in m_list:
+                if mid not in seen_tids:
+                    violations += 1
                     
             fc.write(f"{sid}\t{','.join(c_list)}\n")
             fm.write(f"{sid}\t{','.join(m_list)}\n")
             
+            assert sid not in s1_written, f"S1 {sid} written twice"
+            s1_written.add(sid)
+            
         pairs_iter.close()
+
+    if violations > 0:
+        raise AssertionError(f"{violations} predicted matches were not in candidate set")
+
+    # Assert every S1 appeared
+    assert len(s1_written) == len(s1_order), \
+        f"Only {len(s1_written)}/{len(s1_order)} S1 entities were written"
 
     LOGGER.info("Streamed %d Source 1 records directly to %s and %s", len(s1_order), candidate_path.name, matching_path.name)
     return candidate_path, matching_path

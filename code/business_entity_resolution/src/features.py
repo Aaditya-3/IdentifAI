@@ -79,8 +79,8 @@ _HASH_CACHE = {}
 
 def _hashed_cosine(left: Sequence[str], right: Sequence[str]) -> np.ndarray:
     global _HASH_CACHE
-    if len(_HASH_CACHE) > 200_000:
-        _HASH_CACHE.clear()
+    while len(_HASH_CACHE) > 50_000:
+        _HASH_CACHE.pop(next(iter(_HASH_CACHE)))
 
     def _get(strings: Sequence[str]) -> tuple[list, np.ndarray]:
         missing_idx = []

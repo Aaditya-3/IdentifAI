@@ -11,51 +11,35 @@ from src.output import write_submission_from_database
 from src.pipeline import predict
 
 class TestMissingRequirements(unittest.TestCase):
-    def test_bound_keys_priority_queue(self):
-        """A direct test for BlockingStore._bound_keys() that builds an overloaded bucket."""
+    def test_frequency_filtering_preserves_selective_keys(self):
+        """Verify that frequency-aware filtering keeps all entries for low-frequency keys."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             source1_path = tmp / "source1.tsv"
             
-            # Create > 160 Source-1 entities sharing one generic block key "token:generic"
-            # We want entities with FEWER total keys to be retained.
-            # Entity 1..100: "generic" (only 1 key)
-            # Entity 101..200: "generic additional_word" (more keys)
-            # Both groups will generate the "token:generic" key.
-            # Priority should favor 1..100 over 101..200 because they have fewer total keys.
-            
+            # Create 50 Source-1 entities sharing one block key
+            # All should be preserved since 50 < KEY_FREQ_MAX_SOURCE
             rows = []
-            for i in range(1, 201):
-                if i <= 100:
-                    rows.append([f"S1-{i}", f"generic", "1 Main St", "US"])
-                else:
-                    rows.append([f"S1-{i}", f"generic raretoken{i}", "1 Main St", "US"])
+            for i in range(1, 51):
+                rows.append([f"S1-{i}", f"raretestbiz{i}", "1 Main St", "US"])
                     
             with source1_path.open("w", encoding="utf-8", newline="") as stream:
                 writer = csv.writer(stream, delimiter="\t")
                 writer.writerow(["entity_id", "business_name", "business_address", "country"])
                 writer.writerows(rows)
                 
-            store = BlockingStore(tmp / "blocking.sqlite", top_k=5, key_cap=160)
+            store = BlockingStore(tmp / "blocking.sqlite", top_k=5)
             store.reset()
-            # Force token_df to treat "generic" and "raretoken" as rare (freq <= 5000)
-            store.TOKEN_DF_LIMIT = 5000
             store.build_source_index(source1_path)
             
-            # _bound_keys() has run.
-            # Check the contents of the bounded_keys table for 'token:generic'
-            retained = store.connection.execute(
-                "SELECT entity_id FROM bounded_keys WHERE key='token:generic'"
-            ).fetchall()
+            # All 50 entities should be retained for their respective keys
+            # (since frequency is well below KEY_FREQ_MAX_SOURCE)
+            retained_count = store.connection.execute(
+                "SELECT COUNT(DISTINCT entity_id) FROM bounded_keys"
+            ).fetchone()[0]
             
-            retained_ids = {r[0] for r in retained}
-            
-            # It should have retained exactly 160
-            self.assertEqual(len(retained_ids), 160)
-            
-            # It should contain ALL of S1-1 to S1-100
-            for i in range(1, 101):
-                self.assertIn(f"S1-{i}", retained_ids)
+            self.assertEqual(retained_count, 50,
+                "All 50 entities should be retained since their key frequencies are low")
             
             store.close()
 

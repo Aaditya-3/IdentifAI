@@ -43,6 +43,17 @@ def _build_store(data_dir: str | Path, split: str, database: Path, top_k: int, w
     t_start = time.perf_counter()
     source1, source2, source3 = _dataset_paths(data_dir, split)
     store = BlockingStore(database, top_k=top_k)
+    
+    try:
+        has_final = store.connection.execute("SELECT COUNT(*) FROM final_candidates").fetchone()[0] > 0
+    except sqlite3.OperationalError:
+        has_final = False
+        
+    if has_final:
+        store.diagnostics = {"final": {"recall": store.recall_ceiling()[0]}}
+        LOGGER.info("Reusing existing blocking store at %s", database)
+        return store
+
     store.reset()
     source_count = store.build_source_index(source1)
     if with_truth:
@@ -50,14 +61,35 @@ def _build_store(data_dir: str | Path, split: str, database: Path, top_k: int, w
     store.add_targets_and_retrieve((source2, source3))
     store.finalize_candidates()
     candidates, average = store.candidate_summary()
+
+    # Report blocking diagnostics
+    diag = store.diagnostics
     LOGGER.info("Blocking complete: %d Source-1 records, %d pairs (%.3f/entity) in %.1fs",
                 source_count, candidates, average, time.perf_counter() - t_start)
+    if "raw_blocking" in diag:
+        raw = diag["raw_blocking"]
+        LOGGER.info("  Raw blocking recall: %.4f%% (%d/%d), CMS: %.4f%%",
+                     100 * raw["recall"], raw["retrieved"], raw["total"],
+                     100 * raw.get("complete_match_set_recall", 0))
+    if "final" in diag:
+        fin = diag["final"]
+        LOGGER.info("  Final recall: %.4f%% (%d/%d), CMS: %.4f%%, zero-true S1s: %.4f%%",
+                     100 * fin["recall"], fin["retrieved"], fin["total"],
+                     100 * fin.get("complete_match_set_recall", 0),
+                     100 * fin.get("s1_with_zero_true_candidates", 0))
+    if "final_stats" in diag:
+        fs = diag["final_stats"]
+        LOGGER.info("  Candidate stats: avg=%.1f, p50=%d, p95=%d, p99=%d, max=%d",
+                     fs["avg_candidates"], fs.get("p50", 0), fs.get("p95", 0),
+                     fs.get("p99", 0), fs["max_candidates"])
     return store
 
 
 def _materialize(store: BlockingStore, scratch: Path, name: str, where: str = "", parameters: Sequence[object] = (), labels: bool = True, subsample: bool = False) -> MatrixFiles:
     if labels and subsample:
-        cond = "(truth.target_id IS NOT NULL OR c.similarity > 0.65 OR c.rank <= 4 OR (length(s.name) + length(t.name) + c.rank) % 10 = 0)"
+        # Keep all positives, plus hard/medium/easy negatives via smart sampling.
+        # All negatives with similarity > 0.55 (hard), top-4 ranked (medium), plus 10% random (easy).
+        cond = "(truth.target_id IS NOT NULL OR c.similarity > 0.55 OR c.rank <= 4 OR (length(s.name) + length(t.name) + c.rank) % 10 = 0)"
         where = f"({where}) AND {cond}" if where else cond
     rows = store.feature_count(where, parameters)
     x_path, pairs_path = scratch / f"{name}.features.f32", scratch / f"{name}.pairs.tsv"
@@ -84,6 +116,7 @@ def _materialize(store: BlockingStore, scratch: Path, name: str, where: str = ""
     x.flush()
     if y is not None:
         y.flush()
+    LOGGER.info("Materialized %s: %d rows (%d features)", name, rows, len(FEATURE_NAMES))
     return MatrixFiles(x_path, y_path, pairs_path, rows)
 
 
@@ -229,6 +262,7 @@ def _select_model(store: BlockingStore, fit: MatrixFiles, tune: MatrixFiles,
             baseline_id_score = id_score
 
         results[name] = {"macro_f0_5": score, "threshold": threshold, "id_macro_f0_5": id_score}
+        LOGGER.info("Model %s: country F0.5=%.6f (t=%.3f), ID F0.5=%.6f", name, score, threshold, id_score)
 
         if baseline_id_score is not None and id_score < baseline_id_score - 0.005:
             LOGGER.info("Rejecting %s: ID score %.6f regressed from baseline %.6f", name, id_score, baseline_id_score)
@@ -267,16 +301,39 @@ def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir:
     in_probs = _batched_predict_proba(in_model, in_valid)
     in_score, in_threshold = _fast_tune_threshold(store, in_valid, in_probs, "s.split=0", ())
 
+    # Compute precision/recall at optimal thresholds for detailed reporting
+    def _precision_recall(probs, matrix, threshold):
+        labels = matrix.y()
+        if labels is None:
+            return 0.0, 0.0
+        mask = probs >= threshold
+        tp = int(np.sum(mask & np.asarray(labels, dtype=bool)))
+        fp = int(np.sum(mask & ~np.asarray(labels, dtype=bool)))
+        fn = int(np.sum(~mask & np.asarray(labels, dtype=bool)))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        return prec, rec
+
+    country_prec, country_rec = _precision_recall(
+        _batched_predict_proba(PairModel(seed, class_weight=rev_cw, scale_pos_weight=rev_spw).fit(fit.x(), fit.y()), valid),
+        valid, country_threshold
+    )
+    in_prec, in_rec = _precision_recall(in_probs, in_valid, in_threshold)
+
     report = {
         "country_holdout": {
             "train_country": train_country, "validation_country": validation_country,
             "macro_f0_5": country_score, "threshold": country_threshold,
+            "precision": country_prec, "recall": country_rec,
         },
         "reverse_country_holdout": {
             "train_country": validation_country, "validation_country": train_country,
             "macro_f0_5": rev_score, "threshold": rev_threshold,
         },
-        "in_distribution": {"macro_f0_5": in_score, "threshold": in_threshold},
+        "in_distribution": {
+            "macro_f0_5": in_score, "threshold": in_threshold,
+            "precision": in_prec, "recall": in_rec,
+        },
         "model_selection": {"selected": selected[0], "ablation": weight_results},
         "blocking": {
             "recall": store.recall_ceiling()[0],
@@ -289,6 +346,8 @@ def validate(data_dir: str | Path, top_k: int = 30, seed: int = 42, scratch_dir:
     (scratch / "validation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     LOGGER.info("Validation complete: Country OOD F0.5=%.6f, ID F0.5=%.6f [%.1fs]",
                 country_score, in_score, time.perf_counter() - t_total)
+    LOGGER.info("  Country: prec=%.4f rec=%.4f  |  ID: prec=%.4f rec=%.4f",
+                country_prec, country_rec, in_prec, in_rec)
     store.close()
     return country_score, country_threshold
 
