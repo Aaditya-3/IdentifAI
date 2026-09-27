@@ -25,5 +25,5 @@ make_block_test.py
 
 # OS/editor files
 .DS_Store
-make_block_test
-.venv
+make_real_block_test.py/
+.venv/
