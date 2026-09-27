@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+# Python environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test/cache files
+.pytest_cache/
+
+# Local pipeline artifacts
+scratch/
+output/
+
+# Temporary blocking benchmark
+student_resource/dataset/train_block_test/
+
+# Temporary benchmark script
+make_block_test.py
+
+# OS/editor files
+.DS_Store
+make_real_block_test.py/
+.venv/

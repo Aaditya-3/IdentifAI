@@ -1,2 +1,0 @@
-"""Business entity resolution pipeline."""
-
